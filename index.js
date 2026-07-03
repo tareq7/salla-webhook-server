@@ -43,4 +43,14 @@ app.get('/', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
+    
+    // Self-ping to keep Render free tier awake
+    const SERVER_URL = 'https://salla-webhook-server-lvpy.onrender.com';
+    setInterval(() => {
+        try {
+            fetch(SERVER_URL).then(res => console.log(`Self-ping successful: ${res.status}`));
+        } catch (e) {
+            console.error('Self-ping failed:', e.message);
+        }
+    }, 14 * 60 * 1000); // 14 minutes
 });
