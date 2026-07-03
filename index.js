@@ -1,24 +1,33 @@
 const express = require('express');
 
 const app = express();
-// Keep the raw body so we can pass it along perfectly if needed
 app.use(express.raw({ type: '*/*' }));
 
-// This is the endpoint Salla will call
+// Array to store received webhooks (acts as a temporary database/queue)
+const webhookLogs = [];
+
 app.post('/webhook', async (req, res) => {
-    // 1. Immediately acknowledge the webhook to satisfy Salla's 30s timeout
     res.status(200).send('Webhook Received');
-    console.log('--- New Salla Webhook ---');
-    console.log('Headers:', req.headers);
-
+    
     const bodyString = req.body.toString('utf8');
-    console.log('Body:', bodyString);
+    const timestamp = new Date().toISOString();
+    
+    // Save to our array
+    webhookLogs.push({
+        timestamp,
+        headers: req.headers,
+        body: bodyString ? JSON.parse(bodyString) : null
+    });
+    
+    // Keep only the last 100 to prevent running out of memory
+    if (webhookLogs.length > 100) {
+        webhookLogs.shift(); 
+    }
 
-    // 2. (Optional) Forward the webhook to your laptop if it's online!
+    // Optional: Forward to ngrok if it's set
     const NGROK_URL = process.env.LOCAL_NGROK_URL; 
     if (NGROK_URL) {
         try {
-            console.log(`Forwarding to ${NGROK_URL}/webhook...`);
             await fetch(`${NGROK_URL}/webhook`, {
                 method: 'POST',
                 headers: {
@@ -26,18 +35,31 @@ app.post('/webhook', async (req, res) => {
                     'Authorization': req.headers['authorization'] || '',
                     'X-Salla-Signature': req.headers['x-salla-signature'] || ''
                 },
-                body: req.body // Send the exact raw bytes
+                body: req.body
             });
-            console.log('Forwarded successfully to laptop.');
         } catch (error) {
-            console.error('Failed to forward to laptop (is ngrok running?):', error.message);
+            console.error('Failed to forward to laptop:', error.message);
         }
     }
 });
 
-// A simple GET endpoint so you can verify the server is running in your browser
+// Endpoint to view saved webhooks in your browser!
+app.get('/logs', (req, res) => {
+    res.json({
+        count: webhookLogs.length,
+        logs: webhookLogs
+    });
+});
+
+// Endpoint for your laptop script to fetch and clear the webhooks (Queue polling)
+app.get('/poll', (req, res) => {
+    const data = [...webhookLogs];
+    webhookLogs.length = 0; // Clear the queue after fetching
+    res.json(data);
+});
+
 app.get('/', (req, res) => {
-    res.send('Salla Webhook Server is running!');
+    res.send('Salla Webhook Server is running! Visit /logs to see saved webhooks.');
 });
 
 const PORT = process.env.PORT || 3000;
