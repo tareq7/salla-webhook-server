@@ -6,14 +6,21 @@ const FORWARDED_TTL_SECONDS = 60 * 60 * 24 * 7;    // dedup window for webhook r
 const gclidKey = (joinId) => `gclid:${joinId}`;
 const forwardedKey = (txnId) => `forwarded:${txnId}`;
 
-async function saveGclid(joinId, gclid) {
+async function saveGclid(joinId, trackingId, trackingType) {
   const client = await getRedis();
-  await client.set(gclidKey(joinId), gclid, { EX: GCLID_TTL_SECONDS });
+  const value = JSON.stringify({ id: trackingId, type: trackingType || 'gclid' });
+  await client.set(gclidKey(joinId), value, { EX: GCLID_TTL_SECONDS });
 }
 
 async function getGclid(joinId) {
   const client = await getRedis();
-  return client.get(gclidKey(joinId)); // null if missing/expired, never throws
+  const val = await client.get(gclidKey(joinId));
+  if (!val) return null;
+  try {
+      const parsed = JSON.parse(val);
+      if (parsed && parsed.id && parsed.type) return parsed;
+  } catch(e) {}
+  return { id: val, type: 'gclid' }; // Fallback for old plain-string GCLIDs
 }
 
 // Returns true only the first time a given transaction id is seen (atomic NX check)

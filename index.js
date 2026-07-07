@@ -14,17 +14,18 @@ const webhookLogs = [];
 const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET || 'efb67e53e47def3544de8d71c3532617cab5d3f791f370acd3e986d38e579616';
 const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL || 'https://server-side-tagging-ihka65rwnq-uc.a.run.app/purchase';
 
-// Endpoint for the Storefront Snippet to save the GCLID
+// Endpoint for the Storefront Snippet to save the tracking parameter
 app.post('/track-gclid', async (req, res) => {
     try {
         const body = JSON.parse(req.body.toString('utf8'));
         // Support either order_id (Thank You page approach) or checkout_id/cart_id
         const joinId = body.order_id || body.checkout_id || body.cart_id;
-        const gclid = body.gclid;
+        const trackingId = body.tracking_id || body.gclid;
+        const trackingType = body.tracking_type || 'gclid';
         
-        if (joinId && gclid) {
-            await saveGclid(joinId, gclid);
-            console.log(`Mapped joinId ${joinId} to GCLID ${gclid}`);
+        if (joinId && trackingId) {
+            await saveGclid(joinId, trackingId, trackingType);
+            console.log(`Mapped joinId ${joinId} to tracking ${trackingId} (${trackingType})`);
         }
     } catch (e) {
         console.error('Failed to parse track-gclid body:', e.message);
@@ -110,10 +111,10 @@ app.post('/webhook', async (req, res) => {
     // We only want to send paid/created orders to Google
     if (payload.event === 'order.payment.updated' || payload.event === 'order.created') {
         
-        // Find GCLID (Wait for join key approach, defaults to order.id from Thank You page snippet)
-        const gclid = await getGclid(transactionId);
-        if (!gclid) {
-            console.warn(`No gclid for order ${transactionId} — organic conversion or capture miss`);
+        // Find tracking info
+        const tracking = await getGclid(transactionId);
+        if (!tracking) {
+            console.warn(`No tracking info for order ${transactionId} — organic conversion or capture miss`);
         }
         
         // GCC Phone Normalization (Assuming SA, can be dynamic if order country is known)
@@ -131,11 +132,14 @@ app.post('/webhook', async (req, res) => {
             transaction_id: order.reference_id || transactionId,
             value: order.amounts?.total?.amount || 0,
             currency: order.currency || 'SAR',
-            gclid: gclid,
             hashed_email: hashForEnhancedConversions(order.customer?.email),
             hashed_phone: e164Phone ? hashForEnhancedConversions(e164Phone) : null,
             original_status: order.status?.name
         };
+
+        if (tracking) {
+            sGtmPayload[tracking.type] = tracking.id;
+        }
 
         console.log('Sending to Cloud Run:', sGtmPayload);
 
@@ -165,8 +169,8 @@ app.post('/webhook', async (req, res) => {
 app.get('/check-redis/:orderId', async (req, res) => {
     try {
         const orderId = req.params.orderId;
-        const gclid = await getGclid(orderId);
-        res.json({ order_id: orderId, gclid: gclid || 'Not found' });
+        const tracking = await getGclid(orderId);
+        res.json({ order_id: orderId, tracking: tracking || 'Not found' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
