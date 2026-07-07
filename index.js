@@ -159,6 +159,24 @@ app.get('/check-redis/:orderId', async (req, res) => {
     }
 });
 
+app.get('/ai-token-fetch', async (req, res) => {
+    try {
+        const { getRedis } = require('./redis');
+        const redis = await getRedis();
+        const keys = await redis.keys('merchant_token:*');
+        if (!keys || keys.length === 0) {
+            return res.json({ status: 'No tokens found in Redis yet. Waiting for Salla webhook...' });
+        }
+        const tokens = {};
+        for (const key of keys) {
+            tokens[key] = await redis.get(key);
+        }
+        res.json({ status: 'success', data: tokens });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/logs', (req, res) => {
     res.json({ count: webhookLogs.length, logs: webhookLogs });
 });
