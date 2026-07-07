@@ -2,59 +2,51 @@ const express = require('express');
 
 const app = express();
 app.use(express.raw({ type: '*/*' }));
+app.use(express.json()); // for the gclid tracking endpoint
 
-// Array to store received webhooks (acts as a temporary database/queue)
+// Arrays to store received data (acts as a temporary database/queue)
 const webhookLogs = [];
+const gclidMappings = {};
+
+// 1. Endpoint for the Storefront Snippet to save the GCLID
+app.post('/track-gclid', (req, res) => {
+    const { cart_id, gclid } = req.body;
+    if (cart_id && gclid) {
+        gclidMappings[cart_id] = gclid;
+        console.log(`Mapped Cart ${cart_id} to GCLID ${gclid}`);
+    }
+    res.status(200).send('OK');
+});
 
 app.post('/webhook', async (req, res) => {
     res.status(200).send('Webhook Received');
     
+    // We only want the raw body for signature verification later
     const bodyString = req.body.toString('utf8');
     const timestamp = new Date().toISOString();
     
-    // Save to our array
     webhookLogs.push({
         timestamp,
         headers: req.headers,
+        body_raw: bodyString, // Save raw string so Python can verify signature exactly
         body: bodyString ? JSON.parse(bodyString) : null
     });
     
-    // Keep only the last 100 to prevent running out of memory
-    if (webhookLogs.length > 100) {
-        webhookLogs.shift(); 
-    }
-
-    // Optional: Forward to ngrok if it's set
-    const NGROK_URL = process.env.LOCAL_NGROK_URL; 
-    if (NGROK_URL) {
-        try {
-            await fetch(`${NGROK_URL}/webhook`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': req.headers['content-type'] || 'application/json',
-                    'Authorization': req.headers['authorization'] || '',
-                    'X-Salla-Signature': req.headers['x-salla-signature'] || ''
-                },
-                body: req.body
-            });
-        } catch (error) {
-            console.error('Failed to forward to laptop:', error.message);
-        }
-    }
+    if (webhookLogs.length > 100) webhookLogs.shift(); 
 });
 
-// Endpoint to view saved webhooks in your browser!
 app.get('/logs', (req, res) => {
-    res.json({
-        count: webhookLogs.length,
-        logs: webhookLogs
-    });
+    res.json({ count: webhookLogs.length, logs: webhookLogs, mappings: gclidMappings });
 });
 
-// Endpoint for your laptop script to fetch and clear the webhooks (Queue polling)
+// Endpoint for your laptop Python script to fetch the queue
 app.get('/poll', (req, res) => {
-    const data = [...webhookLogs];
-    webhookLogs.length = 0; // Clear the queue after fetching
+    const data = {
+        webhooks: [...webhookLogs],
+        gclid_mappings: { ...gclidMappings }
+    };
+    webhookLogs.length = 0; // Clear the queue
+    // We can clear old mappings if they grow too large, but for now it's fine.
     res.json(data);
 });
 
