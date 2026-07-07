@@ -68,7 +68,8 @@ app.post('/webhook', async (req, res) => {
     webhookLogs.push({
         timestamp: new Date().toISOString(),
         event: payload.event,
-        order_id: transactionId
+        order_id: transactionId,
+        source_details: order.source_details || null
     });
     if (webhookLogs.length > 100) webhookLogs.shift(); 
 
