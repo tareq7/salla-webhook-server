@@ -31,7 +31,8 @@
 
     // 1. Capture GCLID from URL on any landing page
     const urlParams = new URLSearchParams(window.location.search);
-    const gclid = urlParams.get('gclid');
+    // Support the backup_gclid={gclid} trick to bypass Safari ITP stripping
+    const gclid = urlParams.get('gclid') || urlParams.get('backup_gclid');
     if (gclid) {
         setCookie('_gclid_salla', gclid, 90);
         console.log("[Google Ads] Saved GCLID to cookie:", gclid);
