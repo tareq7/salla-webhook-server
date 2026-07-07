@@ -133,6 +133,17 @@ app.post('/webhook', async (req, res) => {
     res.status(200).send('Webhook Processed');
 });
 
+// Quick debug endpoint to check if an order is in Redis
+app.get('/check-redis/:orderId', async (req, res) => {
+    try {
+        const orderId = req.params.orderId;
+        const gclid = await getGclid(orderId);
+        res.json({ order_id: orderId, gclid: gclid || 'Not found' });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/logs', (req, res) => {
     res.json({ count: webhookLogs.length, logs: webhookLogs });
 });
