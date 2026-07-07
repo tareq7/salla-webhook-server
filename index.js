@@ -72,6 +72,18 @@ app.post('/webhook', async (req, res) => {
     });
     if (webhookLogs.length > 100) webhookLogs.shift(); 
 
+    // Add logging for source details to test the gclid theory
+    if (payload.event === 'order.created' || payload.event === 'order.payment.updated') {
+        console.log(`\n--- Order Webhook Received: ${payload.event} ---`);
+        console.log(`Order ID: ${transactionId}`);
+        if (order.source_details) {
+            console.log(`Source Details:`, JSON.stringify(order.source_details, null, 2));
+        } else {
+            console.log('No source_details in payload.');
+        }
+        console.log('-------------------------------------------\n');
+    }
+
     // Idempotency Check using Redis
     const isNew = await markForwarded(transactionId);
     if (!isNew) {
