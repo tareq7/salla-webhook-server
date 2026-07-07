@@ -9,6 +9,18 @@
         return null;
     }
 
+    function getBestGclid() {
+        const custom = getCookie('_gclid_salla');
+        if (custom) return custom;
+        
+        const gclAw = getCookie('_gcl_aw');
+        if (gclAw) {
+            const parts = gclAw.split('.');
+            if (parts.length >= 3) return parts[2];
+        }
+        return null;
+    }
+
     // Utility to set a cookie
     function setCookie(name, value, days) {
         const d = new Date();
@@ -29,28 +41,23 @@
     document.addEventListener('DOMContentLoaded', () => {
         const orderDataEl = document.getElementById('salla-order-data');
         const orderId = orderDataEl ? orderDataEl.dataset.orderId : null;
-        const storedGclid = getCookie('_gclid_salla');
+        const storedGclid = getBestGclid();
 
         if (orderId && storedGclid) {
             // Send mapping to Render server
             // Ensure this matches your Render server URL
             const RENDER_SERVER_URL = 'https://salla-webhook-server-lvpy.onrender.com/track-gclid'; 
             
-            fetch(RENDER_SERVER_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ order_id: orderId, gclid: storedGclid })
-            })
-            .then(res => {
-                if (res.ok) {
-                    console.log("[Google Ads] Successfully mapped Order ID:", orderId);
-                    // Optional: Clear cookie to prevent re-sending on page reload
-                    // setCookie('_gclid_salla', '', -1);
-                } else {
-                    console.error("[Google Ads] Failed to map Order ID:", res.status);
-                }
-            })
-            .catch(err => console.error("[Google Ads] Network error mapping Order ID:", err));
+            const payload = new Blob([JSON.stringify({ order_id: orderId, gclid: storedGclid })], { type: 'application/json' });
+            const success = navigator.sendBeacon(RENDER_SERVER_URL, payload);
+            
+            if (success) {
+                console.log("[Google Ads] Successfully dispatched mapping for Order ID:", orderId);
+                // Optional: Clear cookie to prevent re-sending on page reload
+                // setCookie('_gclid_salla', '', -1);
+            } else {
+                console.error("[Google Ads] sendBeacon failed for Order ID:", orderId);
+            }
         }
     });
 })();
