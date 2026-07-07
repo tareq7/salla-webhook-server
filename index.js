@@ -1,6 +1,6 @@
 const express = require('express');
 const crypto = require('crypto');
-const { saveGclid, getGclid, markForwarded } = require('./gclidStore');
+const { saveGclid, getGclid, markForwarded, saveMerchantToken } = require('./gclidStore');
 const { normalizePhoneE164, hashForEnhancedConversions } = require('./phoneNormalizer');
 
 const app = express();
@@ -77,6 +77,21 @@ app.post('/webhook', async (req, res) => {
     if (!isNew) {
         console.log(`Duplicate webhook for order ${transactionId}, skipping`);
         return res.status(200).send('OK'); // 200 so Salla doesn't keep retrying
+    }
+
+    // Handle Salla OAuth token delivery
+    if (payload.event === 'app.store.authorize') {
+        const merchantId = payload.merchant;
+        if (merchantId && payload.data) {
+            const { access_token, refresh_token, expires, scope } = payload.data;
+            await saveMerchantToken(merchantId, {
+                access_token,
+                refresh_token,
+                expires_at: expires, // Absolute Unix timestamp
+                scope
+            });
+            console.log(`Saved new authorization tokens for merchant ${merchantId} to Redis`);
+        }
     }
 
     // We only want to send paid/created orders to Google

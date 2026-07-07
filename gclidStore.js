@@ -18,12 +18,26 @@ async function getGclid(joinId) {
 
 // Returns true only the first time a given transaction id is seen (atomic NX check)
 async function markForwarded(transactionId) {
-  const client = await getRedis();
-  const result = await client.set(forwardedKey(transactionId), '1', {
-    EX: FORWARDED_TTL_SECONDS,
-    NX: true,
-  });
-  return result === 'OK';
+    const redis = await getRedis();
+    const key = `forwarded:${transactionId}`;
+    // SET NX returns OK if set, null if it already existed
+    const result = await redis.set(key, '1', { NX: true, EX: 604800 }); // 7 days
+    return result !== null;
 }
 
-module.exports = { saveGclid, getGclid, markForwarded };
+// Token storage for Salla app.store.authorize
+async function saveMerchantToken(merchantId, tokenData) {
+    const redis = await getRedis();
+    const key = `merchant_token:${merchantId}`;
+    // Store as JSON string, expires could be used for TTL but refresh tokens don't expire
+    await redis.set(key, JSON.stringify(tokenData));
+}
+
+async function getMerchantToken(merchantId) {
+    const redis = await getRedis();
+    const key = `merchant_token:${merchantId}`;
+    const data = await redis.get(key);
+    return data ? JSON.parse(data) : null;
+}
+
+module.exports = { saveGclid, getGclid, markForwarded, saveMerchantToken, getMerchantToken };
