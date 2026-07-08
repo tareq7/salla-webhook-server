@@ -5,7 +5,8 @@ const { saveGclid, getGclid, deleteGclid, saveOrderDetails, getOrderDetails, del
 const app = express();
 
 const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET || 'your_salla_webhook_secret';
-const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL || '';
+const SGTM_URL = process.env.SGTM_URL || 'https://server-side-tagging-ihka65rwnq-uc.a.run.app';
+const GA4_MEASUREMENT_ID = process.env.GA4_MEASUREMENT_ID || 'G-KBLW70T89R';
 
 // Support text/plain for the storefront snippet bypassing CORS preflight
 app.use('/track-gclid', express.text({ type: 'text/plain' }));
@@ -52,47 +53,53 @@ function normalizePhoneE164(phoneStr, countryIso) {
     return '+' + digits;
 }
 
-// Common function to send the final payload to sGTM/Cloud Run
+// Send purchase event to sGTM via GA4 Measurement Protocol
 async function sendToSgtm(orderId, tracking, orderDetails) {
-    const sGtmPayload = {
-        event_name: 'purchase',
-        transaction_id: orderDetails.reference_id || orderId,
-        value: parseFloat(orderDetails.amounts?.total?.amount) || 0,
-        currency: orderDetails.currency || 'SAR',
-        hashed_email: hashForEnhancedConversions(orderDetails.customer?.email),
-        hashed_phone: orderDetails.e164Phone ? hashForEnhancedConversions(orderDetails.e164Phone) : null,
-        original_status: orderDetails.status?.name
+    const mpPayload = {
+        client_id: `server.${orderId}`,
+        user_data: {
+            email_address: orderDetails.customer?.email || undefined,
+            phone_number: orderDetails.e164Phone || undefined,
+            address: {
+                first_name: orderDetails.customer?.first_name || undefined,
+                last_name: orderDetails.customer?.last_name || undefined,
+                city: orderDetails.customer?.city || undefined,
+                country: orderDetails.customer?.country?.code || 'SA',
+            },
+        },
+        events: [{
+            name: 'purchase',
+            params: {
+                transaction_id: orderDetails.reference_id || String(orderId),
+                value: parseFloat(orderDetails.amounts?.total?.amount) || 0,
+                currency: orderDetails.currency || 'SAR',
+                ...(tracking ? { [tracking.type]: tracking.id } : {}),
+            },
+        }],
     };
 
-    if (tracking) {
-        sGtmPayload[tracking.type] = tracking.id;
-    }
+    console.log('Sending to sGTM (MP format):', JSON.stringify(mpPayload).slice(0, 300));
 
-    console.log('Sending to Cloud Run:', sGtmPayload);
+    const url = `${SGTM_URL}/mp/collect?measurement_id=${GA4_MEASUREMENT_ID}&api_secret=server_side`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    if (CLOUD_RUN_URL) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5-second hard timeout
-        
-        try {
-            const response = await fetch(CLOUD_RUN_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(sGtmPayload),
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            
-            if (!response.ok) {
-                throw new Error(`Cloud Run returned ${response.status}`);
-            }
-            console.log('Successfully sent to Cloud Run');
-        } catch (e) {
-            clearTimeout(timeoutId);
-            throw e; // Propagate up to clear the idempotency lock!
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(mpPayload),
+            signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        // MP collect returns 204 on success, 200 is also ok
+        if (!response.ok && response.status !== 204) {
+            throw new Error(`sGTM returned ${response.status}`);
         }
-    } else {
-        console.log('CLOUD_RUN_URL is not set. Payload was generated but not sent.');
+        console.log('Successfully sent to sGTM');
+    } catch (e) {
+        clearTimeout(timeoutId);
+        throw e;
     }
 }
 
