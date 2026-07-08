@@ -199,13 +199,6 @@ app.post('/webhook', async (req, res) => {
         console.log('-------------------------------------------\n');
     }
 
-    // Check if already processed
-    const isNew = await markForwarded(transactionId);
-    if (!isNew) {
-        console.log(`Duplicate webhook for order ${transactionId}, skipping`);
-        return res.status(200).send('OK'); 
-    }
-
     try {
         // Handle Salla OAuth token delivery synchronously
         if (payload.event === 'app.store.authorize') {
@@ -228,6 +221,13 @@ app.post('/webhook', async (req, res) => {
                        String(order.payment_status || '').toLowerCase() === 'paid';
                        
         if ((payload.event === 'order.payment.updated' || payload.event === 'order.created') && isPaid) {
+            
+            // Check if already processed (Lock only on Paid orders)
+            const isNew = await markForwarded(transactionId);
+            if (!isNew) {
+                console.log(`Duplicate paid webhook for order ${transactionId}, skipping`);
+                return res.status(200).send('OK'); 
+            }
             
             let countryIso = 'SA';
             if (order.shipping && order.shipping.address && order.shipping.address.country_code) {
