@@ -79,6 +79,12 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
 // Endpoint for the Storefront Snippet to save the tracking parameter
 app.post('/track-gclid', async (req, res) => {
     if (req.method === 'OPTIONS') return res.status(200).send();
+    
+    // Basic shared secret auth
+    const auth = req.headers['x-tracker-auth'];
+    if (auth !== 'storefront_super_secret_123') {
+        return res.status(401).send('Unauthorized');
+    }
 
     try {
         if (!req.body || req.body.length === 0) {
