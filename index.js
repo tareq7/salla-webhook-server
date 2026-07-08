@@ -17,20 +17,40 @@ const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL || 'https://server-side-tagging-
 // Endpoint for the Storefront Snippet to save the tracking parameter
 app.post('/track-gclid', async (req, res) => {
     try {
+        if (!req.body || req.body.length === 0) {
+            return res.status(400).send('Empty body');
+        }
+
         const body = JSON.parse(req.body.toString('utf8'));
-        // Support either order_id (Thank You page approach) or checkout_id/cart_id
         const joinId = body.order_id || body.checkout_id || body.cart_id;
         const trackingId = body.tracking_id || body.gclid;
         const trackingType = body.tracking_type || 'gclid';
         
-        if (joinId && trackingId) {
-            await saveGclid(joinId, trackingId, trackingType);
-            console.log(`Mapped joinId ${joinId} to tracking ${trackingId} (${trackingType})`);
+        // Input validation to prevent Redis exhaustion / garbage data
+        if (!joinId || !trackingId) {
+            return res.status(400).send('Missing joinId or trackingId');
         }
+        
+        const cleanJoinId = String(joinId).slice(0, 50);
+        const cleanTrackingId = String(trackingId).slice(0, 200);
+        
+        if (!['gclid', 'wbraid', 'gbraid'].includes(trackingType)) {
+            return res.status(400).send('Invalid tracking type');
+        }
+
+        await saveGclid(cleanJoinId, cleanTrackingId, trackingType);
+        console.log(`Mapped joinId ${cleanJoinId} to tracking ${cleanTrackingId} (${trackingType})`);
+        
+        return res.status(200).send('OK');
+
     } catch (e) {
-        console.error('Failed to parse track-gclid body:', e.message);
+        console.error('Error in /track-gclid:', e.message);
+        // Distinguish between JSON parse errors (400) and Redis/save errors (500)
+        if (e instanceof SyntaxError) {
+            return res.status(400).send('Invalid JSON');
+        }
+        return res.status(500).send('Internal Server Error');
     }
-    res.status(200).send('OK');
 });
 
 // Webhook Receiver from Salla
