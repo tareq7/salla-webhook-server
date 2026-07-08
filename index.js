@@ -13,10 +13,12 @@ app.use('/track-gclid', express.text({ type: 'text/plain' }));
 // We keep raw body for webhook signature verification
 app.use('/webhook', express.raw({ type: 'application/json' }));
 
-// CORS headers so the storefront snippet can read response.ok
+// CORS headers so the storefront snippet can read response.ok and bypass preflight
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, X-Tracker-Auth');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
 
@@ -63,15 +65,26 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
     console.log('Sending to Cloud Run:', sGtmPayload);
 
     if (CLOUD_RUN_URL) {
-        const response = await fetch(CLOUD_RUN_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(sGtmPayload)
-        });
-        if (!response.ok) {
-            throw new Error(`Cloud Run returned ${response.status}`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5-second hard timeout
+        
+        try {
+            const response = await fetch(CLOUD_RUN_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(sGtmPayload),
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            
+            if (!response.ok) {
+                throw new Error(`Cloud Run returned ${response.status}`);
+            }
+            console.log('Successfully sent to Cloud Run');
+        } catch (e) {
+            clearTimeout(timeoutId);
+            throw e; // Propagate up to clear the idempotency lock!
         }
-        console.log('Successfully sent to Cloud Run');
     } else {
         console.log('CLOUD_RUN_URL is not set. Payload was generated but not sent.');
     }
@@ -79,8 +92,6 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
 
 // Endpoint for the Storefront Snippet to save the tracking parameter
 app.post('/track-gclid', async (req, res) => {
-    if (req.method === 'OPTIONS') return res.status(200).send();
-    
     // Basic shared secret auth
     const auth = req.headers['x-tracker-auth'];
     if (auth !== 'storefront_super_secret_123') {
