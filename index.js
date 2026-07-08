@@ -313,6 +313,47 @@ app.get('/logs', (req, res) => {
     res.json({ count: webhookLogs.length, logs: webhookLogs });
 });
 
+// A scheduled sweep that forwards stale unmatched order_details entries
+// You should call this endpoint periodically (e.g., daily via a Cron job)
+app.get('/cron/sweep-unmatched', async (req, res) => {
+    try {
+        const { getRedis } = require('./redis');
+        const redis = await getRedis();
+        
+        // Find all order_details keys
+        const keys = await redis.keys('order_details:*');
+        if (!keys || keys.length === 0) {
+            return res.status(200).json({ status: 'success', swept: 0, message: 'No unmatched orders found.' });
+        }
+
+        let sweptCount = 0;
+        const sweptIds = [];
+
+        for (const key of keys) {
+            try {
+                const txnId = key.replace('order_details:', '');
+                const raw = await redis.get(key);
+                if (raw) {
+                    const orderDetails = JSON.parse(raw);
+                    // Send to sGTM without tracking info (so we still get Enhanced Conversions signal)
+                    await sendToSgtm(txnId, null, orderDetails);
+                    // Clean up after successful send
+                    await deleteOrderDetails(txnId);
+                    sweptCount++;
+                    sweptIds.push(txnId);
+                }
+            } catch (err) {
+                console.error(`Error sweeping key ${key}:`, err.message);
+            }
+        }
+
+        res.status(200).json({ status: 'success', swept: sweptCount, ids: sweptIds });
+    } catch (e) {
+        console.error('Sweep error:', e);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
