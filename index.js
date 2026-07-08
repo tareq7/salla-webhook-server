@@ -139,12 +139,15 @@ app.post('/track-gclid', async (req, res) => {
         // Rendezvous Check: Did the Salla webhook arrive before this tracking ping?
         const orderDetails = await getOrderDetails(cleanJoinId);
         if (orderDetails) {
-            console.log(`Rendezvous match! Webhook was already here for order ${cleanJoinId}. Forwarding to sGTM.`);
             await sendToSgtm(cleanJoinId, { id: cleanTrackingId, type: trackingType }, orderDetails);
             
-            // Clean up to save Redis space
-            await deleteOrderDetails(cleanJoinId);
-            await deleteGclid(cleanJoinId);
+            // SWALLOW CLEANUP ERRORS to prevent 500s and duplicate sGTM fires
+            try {
+                await deleteOrderDetails(cleanJoinId);
+                await deleteGclid(cleanJoinId);
+            } catch (cleanupErr) {
+                console.error("Rendezvous cleanup failed (conversion was already sent):", cleanupErr);
+            }
         } else {
             console.log(`Tracking info received before webhook for order ${cleanJoinId}. Storing for rendezvous.`);
         }
@@ -259,12 +262,15 @@ app.post('/webhook', async (req, res) => {
             const tracking = await getGclid(transactionId);
             
             if (tracking) {
-                console.log(`Rendezvous match! Client snippet was already here for order ${transactionId}. Forwarding to sGTM.`);
                 await sendToSgtm(transactionId, tracking, order);
                 
-                // Clean up to save Redis space
-                await deleteGclid(transactionId);
-                await deleteOrderDetails(transactionId);
+                // SWALLOW CLEANUP ERRORS to prevent 500s and duplicate sGTM fires
+                try {
+                    await deleteGclid(transactionId);
+                    await deleteOrderDetails(transactionId);
+                } catch (cleanupErr) {
+                    console.error("Rendezvous cleanup failed (conversion was already sent):", cleanupErr);
+                }
             } else {
                 console.log(`Webhook arrived before client snippet for order ${transactionId}. Storing order details for rendezvous.`);
                 await saveOrderDetails(transactionId, order);
