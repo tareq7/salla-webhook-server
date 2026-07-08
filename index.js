@@ -17,7 +17,7 @@ app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, X-Tracker-Auth');
+    res.header('Access-Control-Allow-Headers', 'Content-Type'); // Removed X-Tracker-Auth to keep requests 'simple'
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
@@ -36,10 +36,16 @@ function hashForEnhancedConversions(value) {
 function normalizePhoneE164(phoneStr, countryIso) {
     if (!phoneStr) return null;
     let digits = phoneStr.replace(/\D/g, '');
+    
+    // Strip international 00 prefix
+    if (digits.startsWith('00')) {
+        digits = digits.substring(2);
+    }
+    
     if (countryIso === 'SA') {
         if (digits.startsWith('05')) {
             digits = '966' + digits.substring(1);
-        } else if (digits.startsWith('5')) {
+        } else if (digits.startsWith('5') && digits.length === 9) {
             digits = '966' + digits;
         }
     }
@@ -92,12 +98,6 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
 
 // Endpoint for the Storefront Snippet to save the tracking parameter
 app.post('/track-gclid', async (req, res) => {
-    // Basic shared secret auth
-    const auth = req.headers['x-tracker-auth'];
-    if (auth !== 'storefront_super_secret_123') {
-        return res.status(401).send('Unauthorized');
-    }
-
     try {
         if (!req.body || req.body.length === 0) {
             return res.status(400).send('Empty body');
@@ -110,6 +110,11 @@ app.post('/track-gclid', async (req, res) => {
             body = JSON.parse(req.body.toString('utf8'));
         } else {
             body = req.body;
+        }
+
+        // Basic shared secret auth inside the payload (avoids CORS preflight)
+        if (body.auth !== 'storefront_super_secret_123') {
+            return res.status(401).send('Unauthorized');
         }
 
         const joinId = body.order_id || body.checkout_id || body.cart_id;
