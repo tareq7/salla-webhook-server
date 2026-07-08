@@ -62,16 +62,15 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
     console.log('Sending to Cloud Run:', sGtmPayload);
 
     if (CLOUD_RUN_URL) {
-        try {
-            await fetch(CLOUD_RUN_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(sGtmPayload)
-            });
-            console.log('Successfully sent to Cloud Run');
-        } catch (error) {
-            console.error('Failed to send to Cloud Run:', error.message);
+        const response = await fetch(CLOUD_RUN_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(sGtmPayload)
+        });
+        if (!response.ok) {
+            throw new Error(`Cloud Run returned ${response.status}`);
         }
+        console.log('Successfully sent to Cloud Run');
     } else {
         console.log('CLOUD_RUN_URL is not set. Payload was generated but not sent.');
     }
@@ -192,59 +191,72 @@ app.post('/webhook', async (req, res) => {
         console.log('-------------------------------------------\n');
     }
 
-    // Idempotency Check using Redis
+    // Check if already processed
     const isNew = await markForwarded(transactionId);
     if (!isNew) {
         console.log(`Duplicate webhook for order ${transactionId}, skipping`);
-        return res.status(200).send('OK'); // 200 so Salla doesn't keep retrying
+        return res.status(200).send('OK'); 
     }
 
-    // Respond 200 OK immediately to Salla so the webhook doesn't timeout
-    res.status(200).send('Webhook Processed');
-
-    // Handle Salla OAuth token delivery synchronously (no delay needed)
-    if (payload.event === 'app.store.authorize') {
-        const merchantId = payload.merchant;
-        if (merchantId && payload.data) {
-            const { access_token, refresh_token, expires, scope } = payload.data;
-            await saveMerchantToken(merchantId, {
-                access_token,
-                refresh_token,
-                expires_at: expires, 
-                scope
-            });
-            console.log(`Saved new authorization tokens for merchant ${merchantId} to Redis`);
-        }
-        return;
-    }
-
-    // Process Purchase Webhooks via Rendezvous
-    if (payload.event === 'order.payment.updated' || payload.event === 'order.created') {
-        
-        let countryIso = 'SA';
-        if (order.shipping && order.shipping.address && order.shipping.address.country_code) {
-             countryIso = order.shipping.address.country_code.toUpperCase();
+    try {
+        // Handle Salla OAuth token delivery synchronously
+        if (payload.event === 'app.store.authorize') {
+            const merchantId = payload.merchant;
+            if (merchantId && payload.data) {
+                const { access_token, refresh_token, expires, scope } = payload.data;
+                await saveMerchantToken(merchantId, {
+                    access_token,
+                    refresh_token,
+                    expires_at: expires, 
+                    scope
+                });
+                console.log(`Saved new authorization tokens for merchant ${merchantId} to Redis`);
+            }
+            return res.status(200).send('Webhook Processed');
         }
 
-        const e164Phone = normalizePhoneE164(order.customer?.mobile, countryIso) || normalizePhoneE164(order.customer?.mobile, 'SA');
-        
-        // Attach e164Phone for the sendToSgtm helper
-        order.e164Phone = e164Phone;
-
-        // Rendezvous Check: did the client snippet arrive first?
-        const tracking = await getGclid(transactionId);
-        
-        if (tracking) {
-            console.log(`Rendezvous match! Client snippet was already here for order ${transactionId}. Forwarding to sGTM.`);
-            await sendToSgtm(transactionId, tracking, order);
+        // Process Purchase Webhooks via Rendezvous (Only for Paid orders)
+        const isPaid = String(order.status?.slug || order.status?.name || '').toLowerCase() === 'paid' || 
+                       String(order.payment_status || '').toLowerCase() === 'paid';
+                       
+        if ((payload.event === 'order.payment.updated' || payload.event === 'order.created') && isPaid) {
             
-            // Clean up to save Redis space
-            await deleteGclid(transactionId);
-            await deleteOrderDetails(transactionId);
-        } else {
-            console.log(`Webhook arrived before client snippet for order ${transactionId}. Storing order details for rendezvous.`);
-            await saveOrderDetails(transactionId, order);
+            let countryIso = 'SA';
+            if (order.shipping && order.shipping.address && order.shipping.address.country_code) {
+                 countryIso = order.shipping.address.country_code.toUpperCase();
+            }
+
+            const e164Phone = normalizePhoneE164(order.customer?.mobile, countryIso) || normalizePhoneE164(order.customer?.mobile, 'SA');
+            
+            // Attach e164Phone for the sendToSgtm helper
+            order.e164Phone = e164Phone;
+
+            // Rendezvous Check: did the client snippet arrive first?
+            const tracking = await getGclid(transactionId);
+            
+            if (tracking) {
+                console.log(`Rendezvous match! Client snippet was already here for order ${transactionId}. Forwarding to sGTM.`);
+                await sendToSgtm(transactionId, tracking, order);
+                
+                // Clean up to save Redis space
+                await deleteGclid(transactionId);
+                await deleteOrderDetails(transactionId);
+            } else {
+                console.log(`Webhook arrived before client snippet for order ${transactionId}. Storing order details for rendezvous.`);
+                await saveOrderDetails(transactionId, order);
+            }
         }
+        
+        return res.status(200).send('Webhook Processed');
+    } catch (e) {
+        console.error('Error processing webhook:', e.message);
+        // If an error occurs (like Cloud Run failing), we must clear the idempotency lock
+        // so Salla's next retry will be processed.
+        const { getRedis } = require('./redis');
+        const redis = await getRedis();
+        await redis.del(`forwarded:${transactionId}`);
+        
+        return res.status(500).send('Internal Server Error');
     }
 });
 
