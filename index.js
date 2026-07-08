@@ -7,10 +7,11 @@ const app = express();
 const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET || 'your_salla_webhook_secret';
 const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL || '';
 
-// We keep raw body for webhook signature verification
-app.use(express.raw({ type: '*/*' }));
 // Support text/plain for the storefront snippet bypassing CORS preflight
-app.use(express.text({ type: 'text/plain' }));
+app.use('/track-gclid', express.text({ type: 'text/plain' }));
+
+// We keep raw body for webhook signature verification
+app.use('/webhook', express.raw({ type: 'application/json' }));
 
 // CORS headers so the storefront snippet can read response.ok
 app.use((req, res, next) => {
@@ -48,7 +49,7 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
     const sGtmPayload = {
         event_name: 'purchase',
         transaction_id: orderDetails.reference_id || orderId,
-        value: orderDetails.amounts?.total?.amount || 0,
+        value: parseFloat(orderDetails.amounts?.total?.amount) || 0,
         currency: orderDetails.currency || 'SAR',
         hashed_email: hashForEnhancedConversions(orderDetails.customer?.email),
         hashed_phone: orderDetails.e164Phone ? hashForEnhancedConversions(orderDetails.e164Phone) : null,
@@ -161,6 +162,7 @@ app.post('/webhook', async (req, res) => {
     const sigBuffer = Buffer.from(signature, 'utf8');
     const hashBuffer = Buffer.from(hash, 'utf8');
 
+    // Check length BEFORE timingSafeEqual to prevent TypeError crash
     if (sigBuffer.length !== hashBuffer.length || !crypto.timingSafeEqual(sigBuffer, hashBuffer)) {
         console.error('Signature verification failed! Dropping request.');
         return res.status(401).send('Unauthorized');
