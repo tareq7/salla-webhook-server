@@ -1,27 +1,100 @@
 const express = require('express');
 const crypto = require('crypto');
-const { saveGclid, getGclid, markForwarded, saveMerchantToken } = require('./gclidStore');
-const { normalizePhoneE164, hashForEnhancedConversions } = require('./phoneNormalizer');
+const { saveGclid, getGclid, deleteGclid, saveOrderDetails, getOrderDetails, deleteOrderDetails, markForwarded, saveMerchantToken, getMerchantToken } = require('./gclidStore');
 
 const app = express();
-// Keep the raw body so we can verify the signature perfectly
-app.use(express.raw({ type: '*/*' }));
 
-// Array to store received data for easy debugging (acts as a temporary queue)
+const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET || 'your_salla_webhook_secret';
+const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL || '';
+
+// We keep raw body for webhook signature verification
+app.use(express.raw({ type: '*/*' }));
+// Support text/plain for the storefront snippet bypassing CORS preflight
+app.use(express.text({ type: 'text/plain' }));
+
+// CORS headers so the storefront snippet can read response.ok
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    next();
+});
+
+// A simple in-memory log for debugging (not for production)
 const webhookLogs = [];
 
-// Salla Webhook Secret Key
-const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET || 'efb67e53e47def3544de8d71c3532617cab5d3f791f370acd3e986d38e579616';
-const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL || 'https://server-side-tagging-ihka65rwnq-uc.a.run.app/purchase';
+// Helper function to hash email/phone for Google Enhanced Conversions
+function hashForEnhancedConversions(value) {
+    if (!value) return null;
+    const cleanValue = String(value).trim().toLowerCase();
+    return crypto.createHash('sha256').update(cleanValue).digest('hex');
+}
+
+// Basic E164 normalizer
+function normalizePhoneE164(phoneStr, countryIso) {
+    if (!phoneStr) return null;
+    let digits = phoneStr.replace(/\D/g, '');
+    if (countryIso === 'SA') {
+        if (digits.startsWith('05')) {
+            digits = '966' + digits.substring(1);
+        } else if (digits.startsWith('5')) {
+            digits = '966' + digits;
+        }
+    }
+    return '+' + digits;
+}
+
+// Common function to send the final payload to sGTM/Cloud Run
+async function sendToSgtm(orderId, tracking, orderDetails) {
+    const sGtmPayload = {
+        event_name: 'purchase',
+        transaction_id: orderDetails.reference_id || orderId,
+        value: orderDetails.amounts?.total?.amount || 0,
+        currency: orderDetails.currency || 'SAR',
+        hashed_email: hashForEnhancedConversions(orderDetails.customer?.email),
+        hashed_phone: orderDetails.e164Phone ? hashForEnhancedConversions(orderDetails.e164Phone) : null,
+        original_status: orderDetails.status?.name
+    };
+
+    if (tracking) {
+        sGtmPayload[tracking.type] = tracking.id;
+    }
+
+    console.log('Sending to Cloud Run:', sGtmPayload);
+
+    if (CLOUD_RUN_URL) {
+        try {
+            await fetch(CLOUD_RUN_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(sGtmPayload)
+            });
+            console.log('Successfully sent to Cloud Run');
+        } catch (error) {
+            console.error('Failed to send to Cloud Run:', error.message);
+        }
+    } else {
+        console.log('CLOUD_RUN_URL is not set. Payload was generated but not sent.');
+    }
+}
 
 // Endpoint for the Storefront Snippet to save the tracking parameter
 app.post('/track-gclid', async (req, res) => {
+    if (req.method === 'OPTIONS') return res.status(200).send();
+
     try {
         if (!req.body || req.body.length === 0) {
             return res.status(400).send('Empty body');
         }
 
-        const body = JSON.parse(req.body.toString('utf8'));
+        let body;
+        if (typeof req.body === 'string') {
+            body = JSON.parse(req.body);
+        } else if (Buffer.isBuffer(req.body)) {
+            body = JSON.parse(req.body.toString('utf8'));
+        } else {
+            body = req.body;
+        }
+
         const joinId = body.order_id || body.checkout_id || body.cart_id;
         const trackingId = body.tracking_id || body.gclid;
         const trackingType = body.tracking_type || 'gclid';
@@ -39,8 +112,21 @@ app.post('/track-gclid', async (req, res) => {
         }
 
         await saveGclid(cleanJoinId, cleanTrackingId, trackingType);
-        console.log(`Mapped joinId ${cleanJoinId} to tracking ${cleanTrackingId} (${trackingType})`);
+        console.log(`Saved tracking info for order ${cleanJoinId} (${trackingType})`);
         
+        // Rendezvous Check: Did the Salla webhook arrive before this tracking ping?
+        const orderDetails = await getOrderDetails(cleanJoinId);
+        if (orderDetails) {
+            console.log(`Rendezvous match! Webhook was already here for order ${cleanJoinId}. Forwarding to sGTM.`);
+            await sendToSgtm(cleanJoinId, { id: cleanTrackingId, type: trackingType }, orderDetails);
+            
+            // Clean up to save Redis space
+            await deleteOrderDetails(cleanJoinId);
+            await deleteGclid(cleanJoinId);
+        } else {
+            console.log(`Tracking info received before webhook for order ${cleanJoinId}. Storing for rendezvous.`);
+        }
+
         return res.status(200).send('OK');
 
     } catch (e) {
@@ -66,9 +152,9 @@ app.post('/webhook', async (req, res) => {
     // Cryptographic Signature Verification using timingSafeEqual
     const hash = crypto.createHmac('sha256', SALLA_SECRET).update(bodyRaw).digest('hex');
     
-    // Pad lengths to prevent length-based early exit, though they should both be 64 char hex strings
-    const sigBuffer = Buffer.alloc(64, signature, 'utf8');
-    const hashBuffer = Buffer.alloc(64, hash, 'utf8');
+    // Fixed: Buffer.from preserves length to make the length-mismatch check meaningful
+    const sigBuffer = Buffer.from(signature, 'utf8');
+    const hashBuffer = Buffer.from(hash, 'utf8');
 
     if (sigBuffer.length !== hashBuffer.length || !crypto.timingSafeEqual(sigBuffer, hashBuffer)) {
         console.error('Signature verification failed! Dropping request.');
@@ -132,64 +218,33 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Process Purchase Webhooks Asynchronously to solve Webhook vs Client race condition
+    // Process Purchase Webhooks via Rendezvous
     if (payload.event === 'order.payment.updated' || payload.event === 'order.created') {
         
-        // Fire-and-forget async wrapper
-        (async () => {
-            try {
-                // Poll Redis for up to 60 seconds (6 tries * 10 seconds)
-                let tracking = null;
-                for (let i = 0; i < 6; i++) {
-                    tracking = await getGclid(transactionId);
-                    if (tracking) break;
-                    // Wait 10 seconds before checking again
-                    await new Promise(resolve => setTimeout(resolve, 10000));
-                }
+        let countryIso = 'SA';
+        if (order.shipping && order.shipping.address && order.shipping.address.country_code) {
+             countryIso = order.shipping.address.country_code.toUpperCase();
+        }
 
-                if (!tracking) {
-                    console.warn(`No tracking info for order ${transactionId} after 60s wait — organic conversion or capture miss`);
-                }
-                
-                // GCC Phone Normalization
-                let countryIso = 'SA';
-                if (order.shipping && order.shipping.address && order.shipping.address.country_code) {
-                     countryIso = order.shipping.address.country_code.toUpperCase();
-                }
+        const e164Phone = normalizePhoneE164(order.customer?.mobile, countryIso) || normalizePhoneE164(order.customer?.mobile, 'SA');
+        
+        // Attach e164Phone for the sendToSgtm helper
+        order.e164Phone = e164Phone;
 
-                const e164Phone = normalizePhoneE164(order.customer?.mobile, countryIso) || normalizePhoneE164(order.customer?.mobile, 'SA');
-                
-                // Format for sGTM
-                const sGtmPayload = {
-                    event_name: 'purchase',
-                    transaction_id: order.reference_id || transactionId,
-                    value: order.amounts?.total?.amount || 0,
-                    currency: order.currency || 'SAR',
-                    hashed_email: hashForEnhancedConversions(order.customer?.email),
-                    hashed_phone: e164Phone ? hashForEnhancedConversions(e164Phone) : null,
-                    original_status: order.status?.name
-                };
-
-                if (tracking) {
-                    sGtmPayload[tracking.type] = tracking.id;
-                }
-
-                console.log('Sending to Cloud Run:', sGtmPayload);
-
-                if (CLOUD_RUN_URL) {
-                    await fetch(CLOUD_RUN_URL, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(sGtmPayload)
-                    });
-                    console.log('Successfully sent to Cloud Run');
-                } else {
-                    console.log('CLOUD_RUN_URL is not set. Payload was generated but not sent.');
-                }
-            } catch (err) {
-                console.error('Async webhook processing failed:', err.message);
-            }
-        })();
+        // Rendezvous Check: did the client snippet arrive first?
+        const tracking = await getGclid(transactionId);
+        
+        if (tracking) {
+            console.log(`Rendezvous match! Client snippet was already here for order ${transactionId}. Forwarding to sGTM.`);
+            await sendToSgtm(transactionId, tracking, order);
+            
+            // Clean up to save Redis space
+            await deleteGclid(transactionId);
+            await deleteOrderDetails(transactionId);
+        } else {
+            console.log(`Webhook arrived before client snippet for order ${transactionId}. Storing order details for rendezvous.`);
+            await saveOrderDetails(transactionId, order);
+        }
     }
 });
 
@@ -198,7 +253,8 @@ app.get('/check-redis/:orderId', async (req, res) => {
     try {
         const orderId = req.params.orderId;
         const tracking = await getGclid(orderId);
-        res.json({ order_id: orderId, tracking: tracking || 'Not found' });
+        const details = await getOrderDetails(orderId);
+        res.json({ order_id: orderId, tracking: tracking || 'Not found', order_details: details || 'Not found' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

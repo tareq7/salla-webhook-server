@@ -5,6 +5,7 @@ const FORWARDED_TTL_SECONDS = 60 * 60 * 24 * 7;    // dedup window for webhook r
 
 const gclidKey = (joinId) => `gclid:${joinId}`;
 const forwardedKey = (txnId) => `forwarded:${txnId}`;
+const orderDetailsKey = (txnId) => `order_details:${txnId}`;
 
 async function saveGclid(joinId, trackingId, trackingType) {
   const client = await getRedis();
@@ -20,7 +21,28 @@ async function getGclid(joinId) {
       const parsed = JSON.parse(val);
       if (parsed && parsed.id && parsed.type) return parsed;
   } catch(e) {}
-  return { id: val, type: 'gclid' }; // Fallback for old plain-string GCLIDs
+  return { id: val, type: 'gclid' }; 
+}
+
+async function deleteGclid(joinId) {
+  const client = await getRedis();
+  await client.del(gclidKey(joinId));
+}
+
+async function saveOrderDetails(txnId, details) {
+  const client = await getRedis();
+  await client.set(orderDetailsKey(txnId), JSON.stringify(details), { EX: GCLID_TTL_SECONDS });
+}
+
+async function getOrderDetails(txnId) {
+  const client = await getRedis();
+  const val = await client.get(orderDetailsKey(txnId));
+  return val ? JSON.parse(val) : null;
+}
+
+async function deleteOrderDetails(txnId) {
+  const client = await getRedis();
+  await client.del(orderDetailsKey(txnId));
 }
 
 // Returns true only the first time a given transaction id is seen (atomic NX check)
@@ -47,4 +69,4 @@ async function getMerchantToken(merchantId) {
     return data ? JSON.parse(data) : null;
 }
 
-module.exports = { saveGclid, getGclid, markForwarded, saveMerchantToken, getMerchantToken };
+module.exports = { saveGclid, getGclid, deleteGclid, saveOrderDetails, getOrderDetails, deleteOrderDetails, markForwarded, saveMerchantToken, getMerchantToken };
