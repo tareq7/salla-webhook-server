@@ -7,6 +7,8 @@ const app = express();
 const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET || 'your_salla_webhook_secret';
 const SGTM_URL = process.env.SGTM_URL || 'https://server-side-tagging-ihka65rwnq-uc.a.run.app';
 const GA4_MEASUREMENT_ID = process.env.GA4_MEASUREMENT_ID || 'G-KBLW70T89R';
+const SALLA_CLIENT_ID = process.env.SALLA_CLIENT_ID || '';
+const SALLA_CLIENT_SECRET = process.env.SALLA_CLIENT_SECRET || '';
 
 // Support text/plain for the storefront snippet bypassing CORS preflight
 app.use('/track-gclid', express.text({ type: 'text/plain' }));
@@ -26,11 +28,49 @@ app.use((req, res, next) => {
 // A simple in-memory log for debugging (not for production)
 const webhookLogs = [];
 
-// Helper function to hash email/phone for Google Enhanced Conversions
-function hashForEnhancedConversions(value) {
-    if (!value) return null;
-    const cleanValue = String(value).trim().toLowerCase();
-    return crypto.createHash('sha256').update(cleanValue).digest('hex');
+// Salla OAuth token refresh with mutex (single-use refresh tokens)
+async function getSallaAccessToken(merchantId) {
+    const tokenData = await getMerchantToken(merchantId);
+    if (!tokenData) throw new Error(`No token for merchant ${merchantId}`);
+
+    if (tokenData.expires_at && Date.now() < (tokenData.expires_at * 1000) - 300000) {
+        return tokenData.access_token;
+    }
+
+    const { getRedis } = require('./redis');
+    const redis = await getRedis();
+    const lockKey = `refresh_lock:${merchantId}`;
+    const acquired = await redis.set(lockKey, '1', { NX: true, EX: 30 });
+
+    if (!acquired) {
+        await new Promise(r => setTimeout(r, 2000));
+        return getSallaAccessToken(merchantId);
+    }
+
+    try {
+        const res = await fetch('https://accounts.salla.sa/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                grant_type: 'refresh_token',
+                client_id: SALLA_CLIENT_ID,
+                client_secret: SALLA_CLIENT_SECRET,
+                refresh_token: tokenData.refresh_token,
+            }),
+        });
+        if (!res.ok) throw new Error(`Salla refresh failed: ${res.status}`);
+        const newTokens = await res.json();
+
+        await saveMerchantToken(merchantId, {
+            access_token: newTokens.access_token,
+            refresh_token: newTokens.refresh_token,
+            expires_at: Math.floor(Date.now() / 1000) + newTokens.expires_in,
+            scope: newTokens.scope,
+        });
+        return newTokens.access_token;
+    } finally {
+        await redis.del(lockKey);
+    }
 }
 
 // Basic E164 normalizer
@@ -53,46 +93,53 @@ function normalizePhoneE164(phoneStr, countryIso) {
     return '+' + digits;
 }
 
-// Send purchase event to sGTM via GA4 Measurement Protocol
+// Send purchase event to sGTM via GTag /g/collect wire format
 async function sendToSgtm(orderId, tracking, orderDetails) {
-    const mpPayload = {
-        client_id: `server.${orderId}`,
-        user_data: {
-            email_address: orderDetails.customer?.email || undefined,
-            phone_number: orderDetails.e164Phone || undefined,
-            address: {
-                first_name: orderDetails.customer?.first_name || undefined,
-                last_name: orderDetails.customer?.last_name || undefined,
-                city: orderDetails.customer?.city || undefined,
-                country: orderDetails.customer?.country?.code || 'SA',
-            },
-        },
-        events: [{
-            name: 'purchase',
-            params: {
-                transaction_id: orderDetails.reference_id || String(orderId),
-                value: parseFloat(orderDetails.amounts?.total?.amount) || 0,
-                currency: orderDetails.currency || 'SAR',
-                ...(tracking ? { [tracking.type]: tracking.id } : {}),
-            },
-        }],
-    };
+    const txnId = orderDetails.reference_id || String(orderId);
+    const value = parseFloat(orderDetails.amounts?.total?.amount) || 0;
+    const currency = orderDetails.currency || 'SAR';
 
-    console.log('Sending to sGTM (MP format):', JSON.stringify(mpPayload).slice(0, 300));
+    const params = new URLSearchParams({
+        v: '2',
+        tid: GA4_MEASUREMENT_ID,
+        cid: `server.${orderId}`,
+        en: 'purchase',
+        'ep.transaction_id': txnId,
+        'ep.currency': currency,
+        'epn.value': String(value),
+    });
 
-    const url = `${SGTM_URL}/mp/collect?measurement_id=${GA4_MEASUREMENT_ID}&api_secret=server_side`;
+    // Add click attribution parameter
+    if (tracking?.id) params.set(`ep.${tracking.type}`, tracking.id);
+
+    // Enhanced Conversions: user data as event parameters
+    // sGTM Event Data variables read these via their keyPath
+    const email = orderDetails.customer?.email;
+    const phone = orderDetails.e164Phone;
+    const firstName = orderDetails.customer?.first_name;
+    const lastName = orderDetails.customer?.last_name;
+    const city = orderDetails.customer?.city;
+    const country = orderDetails.customer?.country?.code || 'SA';
+
+    if (email) params.set('ep.user_data.email_address', email.trim().toLowerCase());
+    if (phone) params.set('ep.user_data.phone_number', phone);
+    if (firstName) params.set('ep.user_data.address.first_name', firstName);
+    if (lastName) params.set('ep.user_data.address.last_name', lastName);
+    if (city) params.set('ep.user_data.address.city', city);
+    if (country) params.set('ep.user_data.address.country', country);
+
+    const url = `${SGTM_URL}/g/collect?${params.toString()}`;
+    console.log('Sending to sGTM:', url.slice(0, 300));
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
     try {
         const response = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(mpPayload),
             signal: controller.signal,
         });
         clearTimeout(timeoutId);
-        // MP collect returns 204 on success, 200 is also ok
         if (!response.ok && response.status !== 204) {
             throw new Error(`sGTM returned ${response.status}`);
         }
@@ -102,6 +149,7 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
         throw e;
     }
 }
+
 
 // Endpoint for the Storefront Snippet to save the tracking parameter
 app.post('/track-gclid', async (req, res) => {
