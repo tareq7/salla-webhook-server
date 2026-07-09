@@ -107,6 +107,7 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
         'ep.transaction_id': txnId,
         'ep.currency': currency,
         'epn.value': String(value),
+        dl: 'https://ssp-1.com/thank-you',
     });
 
     // Add click attribution parameter
