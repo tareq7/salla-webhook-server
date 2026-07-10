@@ -10,6 +10,9 @@ if (!SALLA_SECRET) throw new Error('SALLA_WEBHOOK_SECRET is required');
 const STOREFRONT_API_KEY = process.env.STOREFRONT_API_KEY;
 if (!STOREFRONT_API_KEY) throw new Error('STOREFRONT_API_KEY is required');
 
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+if (!ADMIN_SECRET) throw new Error('ADMIN_SECRET is required');
+
 const CRON_SECRET = process.env.CRON_SECRET || 'default_cron_secret_replace_in_prod';
 
 const SGTM_URL = process.env.SGTM_URL || 'https://server-side-tagging-ihka65rwnq-uc.a.run.app';
@@ -362,8 +365,13 @@ app.get('/check-redis/:orderId', async (req, res) => {
     }
 });
 
-app.get('/ai-token-fetch', async (req, res) => {
+app.get('/admin/tokens', async (req, res) => {
     try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || authHeader !== `Bearer ${ADMIN_SECRET}`) {
+            return res.status(401).send('Unauthorized');
+        }
+
         const { getRedis } = require('./redis');
         const redis = await getRedis();
         const keys = await redis.keys('merchant_token:*');
@@ -380,7 +388,11 @@ app.get('/ai-token-fetch', async (req, res) => {
     }
 });
 
-app.get('/logs', (req, res) => {
+app.get('/admin/logs', (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || authHeader !== `Bearer ${ADMIN_SECRET}`) {
+        return res.status(401).send('Unauthorized');
+    }
     res.json({ count: webhookLogs.length, logs: webhookLogs });
 });
 
