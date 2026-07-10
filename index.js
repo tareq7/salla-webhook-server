@@ -4,7 +4,14 @@ const { saveGclid, getGclid, deleteGclid, saveOrderDetails, getOrderDetails, del
 
 const app = express();
 
-const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET || 'your_salla_webhook_secret';
+const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET;
+if (!SALLA_SECRET) throw new Error('SALLA_WEBHOOK_SECRET is required');
+
+const STOREFRONT_API_KEY = process.env.STOREFRONT_API_KEY;
+if (!STOREFRONT_API_KEY) throw new Error('STOREFRONT_API_KEY is required');
+
+const CRON_SECRET = process.env.CRON_SECRET || 'default_cron_secret_replace_in_prod';
+
 const SGTM_URL = process.env.SGTM_URL || 'https://server-side-tagging-ihka65rwnq-uc.a.run.app';
 const GA4_MEASUREMENT_ID = process.env.GA4_MEASUREMENT_ID || 'G-KBLW70T89R';
 const SALLA_CLIENT_ID = process.env.SALLA_CLIENT_ID || '';
@@ -77,20 +84,14 @@ async function getSallaAccessToken(merchantId) {
 function normalizePhoneE164(phoneStr, countryIso) {
     if (!phoneStr) return null;
     let digits = phoneStr.replace(/\D/g, '');
-    
-    // Strip international 00 prefix
-    if (digits.startsWith('00')) {
-        digits = digits.substring(2);
-    }
-    
+    if (digits.startsWith('00')) digits = digits.substring(2);
     if (countryIso === 'SA') {
-        if (digits.startsWith('05')) {
-            digits = '966' + digits.substring(1);
-        } else if (digits.startsWith('5') && digits.length === 9) {
-            digits = '966' + digits;
-        }
+        if (digits.startsWith('05')) digits = '966' + digits.substring(1);
+        else if (digits.startsWith('5') && digits.length === 9) digits = '966' + digits;
     }
-    return '+' + digits;
+    const finalPhone = '+' + digits;
+    if (finalPhone.length < 8 || finalPhone.length > 16) return null;
+    return finalPhone;
 }
 
 // Send purchase event to sGTM via GTag /g/collect wire format
@@ -98,11 +99,12 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
     const txnId = orderDetails.reference_id || String(orderId);
     const value = parseFloat(orderDetails.amounts?.total?.amount) || 0;
     const currency = orderDetails.currency || 'SAR';
+    const clientId = tracking?.clientId || `server.${orderId}`;
 
     const params = new URLSearchParams({
         v: '2',
         tid: GA4_MEASUREMENT_ID,
-        cid: `server.${orderId}`,
+        cid: clientId,
         en: 'purchase',
         'ep.transaction_id': txnId,
         'ep.currency': currency,
@@ -169,13 +171,14 @@ app.post('/track-gclid', async (req, res) => {
         }
 
         // Basic shared secret auth inside the payload (avoids CORS preflight)
-        if (body.auth !== 'storefront_super_secret_123') {
+        if (body.auth !== STOREFRONT_API_KEY) {
             return res.status(401).send('Unauthorized');
         }
 
         const joinId = body.order_id || body.checkout_id || body.cart_id;
         const trackingId = body.tracking_id || body.gclid;
         const trackingType = body.tracking_type || 'gclid';
+        const clientId = body.client_id;
         
         // Input validation to prevent Redis exhaustion / garbage data
         if (!joinId || !trackingId) {
@@ -184,12 +187,13 @@ app.post('/track-gclid', async (req, res) => {
         
         const cleanJoinId = String(joinId).slice(0, 50);
         const cleanTrackingId = String(trackingId).slice(0, 200);
+        const cleanClientId = clientId ? String(clientId).slice(0, 100) : undefined;
         
         if (!['gclid', 'wbraid', 'gbraid'].includes(trackingType)) {
             return res.status(400).send('Invalid tracking type');
         }
 
-        await saveGclid(cleanJoinId, cleanTrackingId, trackingType);
+        await saveGclid(cleanJoinId, cleanTrackingId, trackingType, cleanClientId);
         console.log(`Saved tracking info for order ${cleanJoinId} (${trackingType})`);
         
         // Rendezvous Check: Did the Salla webhook arrive before this tracking ping?
@@ -384,6 +388,11 @@ app.get('/logs', (req, res) => {
 // You should call this endpoint periodically (e.g., daily via a Cron job)
 app.get('/cron/sweep-unmatched', async (req, res) => {
     try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || authHeader !== `Bearer ${CRON_SECRET}`) {
+            return res.status(401).send('Unauthorized');
+        }
+
         const { getRedis } = require('./redis');
         const redis = await getRedis();
         
@@ -395,19 +404,36 @@ app.get('/cron/sweep-unmatched', async (req, res) => {
 
         let sweptCount = 0;
         const sweptIds = [];
+        const now = Date.now();
+        const ONE_DAY = 24 * 60 * 60 * 1000;
 
         for (const key of keys) {
             try {
                 const txnId = key.replace('order_details:', '');
-                const raw = await redis.get(key);
-                if (raw) {
-                    const orderDetails = JSON.parse(raw);
-                    // Send to sGTM without tracking info (so we still get Enhanced Conversions signal)
-                    await sendToSgtm(txnId, null, orderDetails);
-                    // Clean up after successful send
-                    await deleteOrderDetails(txnId);
-                    sweptCount++;
-                    sweptIds.push(txnId);
+                
+                // Use a lock to prevent concurrent sweeps of the same order
+                const lockKey = `sweep_lock:${txnId}`;
+                const acquired = await redis.set(lockKey, '1', { NX: true, EX: 60 });
+                if (!acquired) continue;
+
+                try {
+                    const raw = await redis.get(key);
+                    if (raw) {
+                        const orderDetails = JSON.parse(raw);
+                        
+                        // Age threshold: only sweep if order is older than 24 hours
+                        const timestamp = orderDetails.__timestamp || 0;
+                        if (now - timestamp > ONE_DAY) {
+                            // Send to sGTM without tracking info (so we still get Enhanced Conversions signal)
+                            await sendToSgtm(txnId, null, orderDetails);
+                            // Clean up after successful send
+                            await deleteOrderDetails(txnId);
+                            sweptCount++;
+                            sweptIds.push(txnId);
+                        }
+                    }
+                } finally {
+                    await redis.del(lockKey);
                 }
             } catch (err) {
                 console.error(`Error sweeping key ${key}:`, err.message);

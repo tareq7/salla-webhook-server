@@ -7,9 +7,9 @@ const gclidKey = (joinId) => `gclid:${joinId}`;
 const forwardedKey = (txnId) => `forwarded:${txnId}`;
 const orderDetailsKey = (txnId) => `order_details:${txnId}`;
 
-async function saveGclid(joinId, trackingId, trackingType) {
+async function saveGclid(joinId, trackingId, trackingType, clientId) {
   const client = await getRedis();
-  const value = JSON.stringify({ id: trackingId, type: trackingType || 'gclid' });
+  const value = JSON.stringify({ id: trackingId, type: trackingType || 'gclid', clientId });
   await client.set(gclidKey(joinId), value, { EX: GCLID_TTL_SECONDS });
 }
 
@@ -31,6 +31,7 @@ async function deleteGclid(joinId) {
 
 async function saveOrderDetails(txnId, details) {
   const client = await getRedis();
+  details.__timestamp = Date.now();
   await client.set(orderDetailsKey(txnId), JSON.stringify(details), { EX: GCLID_TTL_SECONDS });
 }
 
