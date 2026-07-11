@@ -1,14 +1,23 @@
 const express = require('express');
 const crypto = require('crypto');
-const { saveGclid, getGclid, deleteGclid, saveOrderDetails, getOrderDetails, deleteOrderDetails, markForwarded, saveMerchantToken, getMerchantToken } = require('./gclidStore');
+const rateLimit = require('express-rate-limit');
+const { 
+    saveTracking, 
+    getTrackingForOrder, 
+    deleteTrackingForOrder, 
+    saveOrderDetails, 
+    getOrderDetails, 
+    deleteOrderDetails, 
+    getOrderIdByCartId, 
+    markForwarded, 
+    saveMerchantToken, 
+    getMerchantToken 
+} = require('./gclidStore');
 
 const app = express();
 
 const SALLA_SECRET = process.env.SALLA_WEBHOOK_SECRET;
 if (!SALLA_SECRET) throw new Error('SALLA_WEBHOOK_SECRET is required');
-
-const STOREFRONT_API_KEY = process.env.STOREFRONT_API_KEY;
-if (!STOREFRONT_API_KEY) throw new Error('STOREFRONT_API_KEY is required');
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 if (!ADMIN_SECRET) throw new Error('ADMIN_SECRET is required');
@@ -20,17 +29,26 @@ const GA4_MEASUREMENT_ID = process.env.GA4_MEASUREMENT_ID || 'G-KBLW70T89R';
 const SALLA_CLIENT_ID = process.env.SALLA_CLIENT_ID || '';
 const SALLA_CLIENT_SECRET = process.env.SALLA_CLIENT_SECRET || '';
 
+// Rate Limiter for the public /track-gclid endpoint
+const trackLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Too many requests from this IP, please try again later.'
+});
+
 // Support text/plain for the storefront snippet bypassing CORS preflight
 app.use('/track-gclid', express.text({ type: 'text/plain' }));
 
 // We keep raw body for webhook signature verification
 app.use('/webhook', express.raw({ type: 'application/json' }));
 
-// CORS headers so the storefront snippet can read response.ok and bypass preflight
+// CORS headers so the storefront snippet can read response.ok
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type'); // Removed X-Tracker-Auth to keep requests 'simple'
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
@@ -119,7 +137,6 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
     if (tracking?.id) params.set(`ep.${tracking.type}`, tracking.id);
 
     // Enhanced Conversions: user data as event parameters
-    // sGTM Event Data variables read these via their keyPath
     const email = orderDetails.customer?.email;
     const phone = orderDetails.e164Phone;
     const firstName = orderDetails.customer?.first_name;
@@ -156,9 +173,18 @@ async function sendToSgtm(orderId, tracking, orderDetails) {
     }
 }
 
+// Input validation helper
+function isValidIdentifier(value, maxLength) {
+    return (
+        typeof value === 'string' &&
+        value.length > 0 &&
+        value.length <= maxLength &&
+        /^[A-Za-z0-9._~-]+$/.test(value)
+    );
+}
 
-// Endpoint for the Storefront Snippet to save the tracking parameter
-app.post('/track-gclid', async (req, res) => {
+// Endpoint for the Storefront Snippet to save the tracking parameter (Public)
+app.post('/track-gclid', trackLimiter, async (req, res) => {
     try {
         if (!req.body || req.body.length === 0) {
             return res.status(400).send('Empty body');
@@ -173,53 +199,58 @@ app.post('/track-gclid', async (req, res) => {
             body = req.body;
         }
 
-        // Basic shared secret auth inside the payload (avoids CORS preflight)
-        if (body.auth !== STOREFRONT_API_KEY) {
-            return res.status(401).send('Unauthorized');
-        }
-
-        const joinId = body.order_id || body.checkout_id || body.cart_id;
-        const trackingId = body.tracking_id || body.gclid;
-        const trackingType = body.tracking_type || 'gclid';
+        const entityType = body.entity_type;
+        const entityId = body.entity_id;
+        const trackingId = body.tracking_id;
+        const trackingType = body.tracking_type;
         const clientId = body.client_id;
         
-        // Input validation to prevent Redis exhaustion / garbage data
-        if (!joinId || !trackingId) {
-            return res.status(400).send('Missing joinId or trackingId');
+        // Enforce strict input validation
+        if (!['cart', 'order'].includes(entityType)) {
+            return res.status(400).send('Invalid entity type');
         }
-        
-        const cleanJoinId = String(joinId).slice(0, 50);
-        const cleanTrackingId = String(trackingId).slice(0, 200);
-        const cleanClientId = clientId ? String(clientId).slice(0, 100) : undefined;
-        
+        if (!isValidIdentifier(entityId, 128)) {
+            return res.status(400).send('Invalid entity ID');
+        }
+        if (!isValidIdentifier(trackingId, 256)) {
+            return res.status(400).send('Invalid tracking ID');
+        }
         if (!['gclid', 'wbraid', 'gbraid'].includes(trackingType)) {
             return res.status(400).send('Invalid tracking type');
         }
+        if (clientId && !isValidIdentifier(clientId, 100)) {
+            return res.status(400).send('Invalid client ID');
+        }
 
-        await saveGclid(cleanJoinId, cleanTrackingId, trackingType, cleanClientId);
-        console.log(`Saved tracking info for order ${cleanJoinId} (${trackingType})`);
+        // Save tracking parameter in Redis
+        await saveTracking(entityType, entityId, { tracking_id: trackingId, tracking_type: trackingType, client_id: clientId });
+        console.log(`Saved tracking info for ${entityType} ${entityId} (${trackingType})`);
         
         // Rendezvous Check: Did the Salla webhook arrive before this tracking ping?
-        const orderDetails = await getOrderDetails(cleanJoinId);
-        if (orderDetails) {
-            await sendToSgtm(cleanJoinId, { id: cleanTrackingId, type: trackingType }, orderDetails);
-            
-            // SWALLOW CLEANUP ERRORS to prevent 500s and duplicate sGTM fires
-            try {
-                await deleteOrderDetails(cleanJoinId);
-                await deleteGclid(cleanJoinId);
-            } catch (cleanupErr) {
-                console.error("Rendezvous cleanup failed (conversion was already sent):", cleanupErr);
+        if (entityType === 'cart') {
+            const orderId = await getOrderIdByCartId(entityId);
+            if (orderId) {
+                const orderDetails = await getOrderDetails(orderId);
+                if (orderDetails) {
+                    await sendToSgtm(orderId, { id: trackingId, type: trackingType, clientId }, orderDetails);
+                    await deleteOrderDetails(orderId);
+                    await deleteTrackingForOrder(orderId, entityId);
+                }
             }
-        } else {
-            console.log(`Tracking info received before webhook for order ${cleanJoinId}. Storing for rendezvous.`);
+        } else if (entityType === 'order') {
+            const orderDetails = await getOrderDetails(entityId);
+            if (orderDetails) {
+                const cartId = orderDetails.cart_id ? String(orderDetails.cart_id) : null;
+                await sendToSgtm(entityId, { id: trackingId, type: trackingType, clientId }, orderDetails);
+                await deleteOrderDetails(entityId);
+                await deleteTrackingForOrder(entityId, cartId);
+            }
         }
 
         return res.status(200).send('OK');
 
     } catch (e) {
         console.error('Error in /track-gclid:', e.message);
-        // Distinguish between JSON parse errors (400) and Redis/save errors (500)
         if (e instanceof SyntaxError) {
             return res.status(400).send('Invalid JSON');
         }
@@ -237,14 +268,11 @@ app.post('/webhook', async (req, res) => {
         return res.status(401).send('Unauthorized');
     }
 
-    // Cryptographic Signature Verification using timingSafeEqual
+    // Cryptographic Signature Verification
     const hash = crypto.createHmac('sha256', SALLA_SECRET).update(bodyRaw).digest('hex');
-    
-    // Fixed: Buffer.from preserves length to make the length-mismatch check meaningful
     const sigBuffer = Buffer.from(signature, 'utf8');
     const hashBuffer = Buffer.from(hash, 'utf8');
 
-    // Check length BEFORE timingSafeEqual to prevent TypeError crash
     if (sigBuffer.length !== hashBuffer.length || !crypto.timingSafeEqual(sigBuffer, hashBuffer)) {
         console.error('Signature verification failed! Dropping request.');
         return res.status(401).send('Unauthorized');
@@ -260,7 +288,7 @@ app.post('/webhook', async (req, res) => {
     const order = payload.data;
     const transactionId = String(order.id);
 
-    // Log it for manual review
+    // Log for manual review
     webhookLogs.push({
         timestamp: new Date().toISOString(),
         event: payload.event,
@@ -269,20 +297,16 @@ app.post('/webhook', async (req, res) => {
     });
     if (webhookLogs.length > 100) webhookLogs.shift(); 
 
-    // Add logging for source details to test the gclid theory
     if (payload.event === 'order.created' || payload.event === 'order.payment.updated') {
         console.log(`\n--- Order Webhook Received: ${payload.event} ---`);
         console.log(`Order ID: ${transactionId}`);
         if (order.source_details) {
             console.log(`Source Details:`, JSON.stringify(order.source_details, null, 2));
-        } else {
-            console.log('No source_details in payload.');
         }
         console.log('-------------------------------------------\n');
     }
 
     try {
-        // Handle Salla OAuth token delivery synchronously
         if (payload.event === 'app.store.authorize') {
             const merchantId = payload.merchant;
             if (merchantId && payload.data) {
@@ -298,13 +322,13 @@ app.post('/webhook', async (req, res) => {
             return res.status(200).send('Webhook Processed');
         }
 
-        // Process Purchase Webhooks via Rendezvous (Only for Paid orders)
+        // Process Purchase Webhooks (Only for Paid orders)
         const isPaid = String(order.status?.slug || order.status?.name || '').toLowerCase() === 'paid' || 
                        String(order.payment_status || '').toLowerCase() === 'paid';
                        
         if ((payload.event === 'order.payment.updated' || payload.event === 'order.created') && isPaid) {
             
-            // Check if already processed (Lock only on Paid orders)
+            // Check if already processed
             const isNew = await markForwarded(transactionId);
             if (!isNew) {
                 console.log(`Duplicate paid webhook for order ${transactionId}, skipping`);
@@ -317,47 +341,38 @@ app.post('/webhook', async (req, res) => {
             }
 
             const e164Phone = normalizePhoneE164(order.customer?.mobile, countryIso) || normalizePhoneE164(order.customer?.mobile, 'SA');
-            
-            // Attach e164Phone for the sendToSgtm helper
             order.e164Phone = e164Phone;
 
+            const cartId = order.cart_id ? String(order.cart_id) : null;
+
             // Rendezvous Check: did the client snippet arrive first?
-            const tracking = await getGclid(transactionId);
+            const tracking = await getTrackingForOrder(transactionId, cartId);
             
             if (tracking) {
                 await sendToSgtm(transactionId, tracking, order);
-                
-                // SWALLOW CLEANUP ERRORS to prevent 500s and duplicate sGTM fires
-                try {
-                    await deleteGclid(transactionId);
-                    await deleteOrderDetails(transactionId);
-                } catch (cleanupErr) {
-                    console.error("Rendezvous cleanup failed (conversion was already sent):", cleanupErr);
-                }
+                await deleteTrackingForOrder(transactionId, cartId);
+                await deleteOrderDetails(transactionId);
             } else {
                 console.log(`Webhook arrived before client snippet for order ${transactionId}. Storing order details for rendezvous.`);
-                await saveOrderDetails(transactionId, order);
+                await saveOrderDetails(transactionId, cartId, order);
             }
         }
         
         return res.status(200).send('Webhook Processed');
     } catch (e) {
         console.error('Error processing webhook:', e.message);
-        // If an error occurs (like Cloud Run failing), we must clear the idempotency lock
-        // so Salla's next retry will be processed.
         const { getRedis } = require('./redis');
         const redis = await getRedis();
         await redis.del(`forwarded:${transactionId}`);
-        
         return res.status(500).send('Internal Server Error');
     }
 });
 
-// Quick debug endpoint to check if an order is in Redis
+// Quick debug endpoint
 app.get('/check-redis/:orderId', async (req, res) => {
     try {
         const orderId = req.params.orderId;
-        const tracking = await getGclid(orderId);
+        const tracking = await getTrackingForOrder(orderId, null);
         const details = await getOrderDetails(orderId);
         res.json({ order_id: orderId, tracking: tracking || 'Not found', order_details: details || 'Not found' });
     } catch (e) {
@@ -376,7 +391,7 @@ app.get('/admin/tokens', async (req, res) => {
         const redis = await getRedis();
         const keys = await redis.keys('merchant_token:*');
         if (!keys || keys.length === 0) {
-            return res.json({ status: 'No tokens found in Redis yet. Waiting for Salla webhook...' });
+            return res.json({ status: 'No tokens found in Redis yet.' });
         }
         const tokens = {};
         for (const key of keys) {
@@ -396,8 +411,7 @@ app.get('/admin/logs', (req, res) => {
     res.json({ count: webhookLogs.length, logs: webhookLogs });
 });
 
-// A scheduled sweep that forwards stale unmatched order_details entries
-// You should call this endpoint periodically (e.g., daily via a Cron job)
+// Scheduled sweep endpoint
 app.get('/cron/sweep-unmatched', async (req, res) => {
     try {
         const authHeader = req.headers.authorization;
@@ -408,7 +422,6 @@ app.get('/cron/sweep-unmatched', async (req, res) => {
         const { getRedis } = require('./redis');
         const redis = await getRedis();
         
-        // Find all order_details keys
         const keys = await redis.keys('order_details:*');
         if (!keys || keys.length === 0) {
             return res.status(200).json({ status: 'success', swept: 0, message: 'No unmatched orders found.' });
@@ -423,7 +436,6 @@ app.get('/cron/sweep-unmatched', async (req, res) => {
             try {
                 const txnId = key.replace('order_details:', '');
                 
-                // Use a lock to prevent concurrent sweeps of the same order
                 const lockKey = `sweep_lock:${txnId}`;
                 const acquired = await redis.set(lockKey, '1', { NX: true, EX: 60 });
                 if (!acquired) continue;
@@ -433,12 +445,9 @@ app.get('/cron/sweep-unmatched', async (req, res) => {
                     if (raw) {
                         const orderDetails = JSON.parse(raw);
                         
-                        // Age threshold: only sweep if order is older than 24 hours
                         const timestamp = orderDetails.__timestamp || 0;
                         if (now - timestamp > ONE_DAY) {
-                            // Send to sGTM without tracking info (so we still get Enhanced Conversions signal)
                             await sendToSgtm(txnId, null, orderDetails);
-                            // Clean up after successful send
                             await deleteOrderDetails(txnId);
                             sweptCount++;
                             sweptIds.push(txnId);

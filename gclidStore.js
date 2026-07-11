@@ -1,57 +1,115 @@
 const { getRedis } = require('./redis.js');
 
-const GCLID_TTL_SECONDS = 60 * 60 * 24 * 30;      // capture window before we give up on a cart/order
-const FORWARDED_TTL_SECONDS = 60 * 60 * 24 * 7;    // dedup window for webhook retries
+const GCLID_TTL_SECONDS = 60 * 60 * 24 * 30;      // 30 days capture window
+const FORWARDED_TTL_SECONDS = 60 * 60 * 24 * 7;    // 7 days deduplication window
 
-const gclidKey = (joinId) => `gclid:${joinId}`;
+// Key patterns
+const cartGclidKey = (cartId) => `gclid:cart:${cartId}`;
+const orderGclidKey = (orderId) => `gclid:order:${orderId}`;
+const cartToOrderKey = (cartId) => `cart_to_order:${cartId}`;
+const orderDetailsKey = (orderId) => `order_details:${orderId}`;
 const forwardedKey = (txnId) => `forwarded:${txnId}`;
-const orderDetailsKey = (txnId) => `order_details:${txnId}`;
 
-async function saveGclid(joinId, trackingId, trackingType, clientId) {
-  const client = await getRedis();
-  const value = JSON.stringify({ id: trackingId, type: trackingType || 'gclid', clientId });
-  await client.set(gclidKey(joinId), value, { EX: GCLID_TTL_SECONDS });
+/**
+ * Saves a browser tracking click event.
+ * Matches entityType ('cart' or 'order') and stores click parameters.
+ */
+async function saveTracking(entityType, entityId, trackingData) {
+    const client = await getRedis();
+    const key = entityType === 'cart' ? cartGclidKey(entityId) : orderGclidKey(entityId);
+    const value = JSON.stringify({
+        id: trackingData.tracking_id,
+        type: trackingData.tracking_type,
+        clientId: trackingData.client_id,
+        timestamp: Date.now()
+    });
+    await client.set(key, value, { EX: GCLID_TTL_SECONDS });
 }
 
-async function getGclid(joinId) {
-  const client = await getRedis();
-  const val = await client.get(gclidKey(joinId));
-  if (!val) return null;
-  try {
-      const parsed = JSON.parse(val);
-      if (parsed && parsed.id && parsed.type) return parsed;
-  } catch(e) {}
-  return { id: val, type: 'gclid' }; 
+/**
+ * Double-lookup to find click tracking details for a completed order.
+ * Checks gclid:order:${orderId} first, then falls back to gclid:cart:${cartId}.
+ */
+async function getTrackingForOrder(orderId, cartId) {
+    const client = await getRedis();
+    
+    // 1. Check order tracking first (in case tracking fired late on thank-you page)
+    let val = await client.get(orderGclidKey(orderId));
+    if (val) {
+        try { return JSON.parse(val); } catch (e) {}
+    }
+    
+    // 2. Check cart tracking (standard flow)
+    if (cartId) {
+        val = await client.get(cartGclidKey(cartId));
+        if (val) {
+            try { return JSON.parse(val); } catch (e) {}
+        }
+    }
+    
+    return null;
 }
 
-async function deleteGclid(joinId) {
-  const client = await getRedis();
-  await client.del(gclidKey(joinId));
+/**
+ * Atomic cleanup of all Redis keys associated with a mapped conversion.
+ */
+async function deleteTrackingForOrder(orderId, cartId) {
+    const client = await getRedis();
+    const keys = [orderGclidKey(orderId)];
+    if (cartId) {
+        keys.push(cartGclidKey(cartId));
+        keys.push(cartToOrderKey(cartId));
+    }
+    await client.del(keys);
 }
 
-async function saveOrderDetails(txnId, details) {
-  const client = await getRedis();
-  details.__timestamp = Date.now();
-  await client.set(orderDetailsKey(txnId), JSON.stringify(details), { EX: GCLID_TTL_SECONDS });
+/**
+ * Saves order details (webhook payload) when the webhook arrives before tracking.
+ * If cartId is present, also saves a mapping cartId -> orderId.
+ */
+async function saveOrderDetails(orderId, cartId, details) {
+    const client = await getRedis();
+    details.__timestamp = Date.now();
+    
+    await client.set(orderDetailsKey(orderId), JSON.stringify(details), { EX: GCLID_TTL_SECONDS });
+    
+    if (cartId) {
+        await client.set(cartToOrderKey(cartId), String(orderId), { EX: GCLID_TTL_SECONDS });
+    }
 }
 
-async function getOrderDetails(txnId) {
-  const client = await getRedis();
-  const val = await client.get(orderDetailsKey(txnId));
-  return val ? JSON.parse(val) : null;
+/**
+ * Fetches order details by order ID.
+ */
+async function getOrderDetails(orderId) {
+    const client = await getRedis();
+    const val = await client.get(orderDetailsKey(orderId));
+    return val ? JSON.parse(val) : null;
 }
 
-async function deleteOrderDetails(txnId) {
-  const client = await getRedis();
-  await client.del(orderDetailsKey(txnId));
+/**
+ * Deletes order details when the rendezvous is complete.
+ */
+async function deleteOrderDetails(orderId) {
+    const client = await getRedis();
+    await client.del(orderDetailsKey(orderId));
 }
 
-// Returns true only the first time a given transaction id is seen (atomic NX check)
+/**
+ * Returns mapped orderId if a cartId is already associated with an order.
+ */
+async function getOrderIdByCartId(cartId) {
+    const client = await getRedis();
+    return await client.get(cartToOrderKey(cartId));
+}
+
+/**
+ * Returns true only the first time a given transaction id is seen (atomic NX check)
+ */
 async function markForwarded(transactionId) {
     const redis = await getRedis();
-    const key = `forwarded:${transactionId}`;
-    // SET NX returns OK if set, null if it already existed
-    const result = await redis.set(key, '1', { NX: true, EX: 604800 }); // 7 days
+    const key = forwardedKey(transactionId);
+    const result = await redis.set(key, '1', { NX: true, EX: FORWARDED_TTL_SECONDS });
     return result !== null;
 }
 
@@ -59,7 +117,6 @@ async function markForwarded(transactionId) {
 async function saveMerchantToken(merchantId, tokenData) {
     const redis = await getRedis();
     const key = `merchant_token:${merchantId}`;
-    // Store as JSON string, expires could be used for TTL but refresh tokens don't expire
     await redis.set(key, JSON.stringify(tokenData));
 }
 
@@ -70,4 +127,15 @@ async function getMerchantToken(merchantId) {
     return data ? JSON.parse(data) : null;
 }
 
-module.exports = { saveGclid, getGclid, deleteGclid, saveOrderDetails, getOrderDetails, deleteOrderDetails, markForwarded, saveMerchantToken, getMerchantToken };
+module.exports = {
+    saveTracking,
+    getTrackingForOrder,
+    deleteTrackingForOrder,
+    saveOrderDetails,
+    getOrderDetails,
+    deleteOrderDetails,
+    getOrderIdByCartId,
+    markForwarded,
+    saveMerchantToken,
+    getMerchantToken
+};
