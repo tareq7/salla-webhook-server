@@ -1,15 +1,13 @@
+'use strict';
 const { createClient } = require('redis');
-
-const redis = createClient({ url: process.env.REDIS_URL }); // rediss://default:<pw>@<host>:<port>
-redis.on('error', (err) => console.error('Redis Client Error', err));
-
-let connected = false;
+const redis = createClient({ url: process.env.REDIS_URL });
+redis.on('error', error => console.error('Redis client error', { message: error.message }));
+let connectionPromise;
 async function getRedis() {
-  if (!connected) {
-    await redis.connect();
-    connected = true;
-  }
-  return redis;
+    if (redis.isReady) return redis;
+    if (!connectionPromise) connectionPromise = redis.connect().catch(error => { connectionPromise = null; throw error; });
+    await connectionPromise;
+    return redis;
 }
-
-module.exports = { getRedis };
+async function closeRedis() { if (redis.isOpen) await redis.quit(); }
+module.exports = { getRedis, closeRedis };
