@@ -411,6 +411,69 @@ app.get('/admin/logs', (req, res) => {
     res.json({ count: webhookLogs.length, logs: webhookLogs });
 });
 
+app.get('/admin/db-status', async (req, res) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || authHeader !== `Bearer ${ADMIN_SECRET}`) {
+            return res.status(401).send('Unauthorized');
+        }
+
+        const { getRedis } = require('./redis');
+        const redis = await getRedis();
+        
+        const forwardedKeys = await redis.keys('forwarded:*');
+        const gclidKeys = await redis.keys('gclid:*');
+        const orderDetailsKeys = await redis.keys('order_details:*');
+        const cartToOrderKeys = await redis.keys('cart_to_order:*');
+
+        const forwarded = forwardedKeys.map(k => k.replace('forwarded:', ''));
+        const pendingClicks = {};
+        for (const key of gclidKeys) {
+            try {
+                const val = await redis.get(key);
+                pendingClicks[key] = val ? JSON.parse(val) : null;
+            } catch (e) {
+                pendingClicks[key] = await redis.get(key);
+            }
+        }
+
+        const pendingOrders = {};
+        for (const key of orderDetailsKeys) {
+            const val = await redis.get(key);
+            if (val) {
+                try {
+                    const parsed = JSON.parse(val);
+                    pendingOrders[key] = {
+                        order_id: parsed.id,
+                        reference_id: parsed.reference_id,
+                        total: parsed.amounts?.total?.amount,
+                        currency: parsed.currency,
+                        email: parsed.customer?.email,
+                        timestamp: parsed.__timestamp
+                    };
+                } catch(e) {
+                    pendingOrders[key] = 'parse_error';
+                }
+            }
+        }
+
+        res.json({
+            status: 'success',
+            summary: {
+                processed_orders_count: forwarded.length,
+                pending_clicks_count: gclidKeys.length,
+                pending_orders_count: orderDetailsKeys.length,
+                cart_to_order_mappings_count: cartToOrderKeys.length
+            },
+            processed_orders: forwarded,
+            pending_clicks: pendingClicks,
+            pending_orders: pendingOrders
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // Scheduled sweep endpoint
 app.get('/cron/sweep-unmatched', async (req, res) => {
     try {
