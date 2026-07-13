@@ -160,6 +160,8 @@ app.post('/webhook', async (req, res) => {
             const cartId = order.cart_id ? String(order.cart_id) : null;
             await store.saveOrderDetails(orderId, cartId, order);
             await reconcile(orderId, cartId); // write then re-read closes the lost-wakeup race
+        } else {
+            await store.saveRejectedWebhook(orderId, payload);
         }
         res.status(200).send('Webhook Processed');
     } catch (error) {
@@ -174,11 +176,33 @@ app.get('/admin/logs', (req, res) => authorized(req, ADMIN_SECRET) ? res.json({ 
 app.get('/admin/db-status', async (req, res) => {
     if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
     try {
-        const [sent, clicks, orders, mappings] = await Promise.all([
-            store.scanKeys('sent:*'), store.scanKeys('gclid:*'), store.scanKeys('order_details:*'), store.scanKeys('cart_to_order:*')
+        const [sent, clicks, orders, mappings, rejected] = await Promise.all([
+            store.scanKeys('sent:*'), store.scanKeys('gclid:*'), store.scanKeys('order_details:*'), store.scanKeys('cart_to_order:*'), store.scanKeys('rejected_webhook:*')
         ]);
-        res.json({ status: 'success', summary: { processed_orders_count: sent.length, pending_clicks_count: clicks.length, pending_orders_count: orders.length, cart_to_order_mappings_count: mappings.length } });
+        res.json({ status: 'success', summary: { processed_orders_count: sent.length, pending_clicks_count: clicks.length, pending_orders_count: orders.length, cart_to_order_mappings_count: mappings.length, rejected_webhooks_count: rejected.length } });
     } catch (error) { res.status(500).json({ error: 'Internal Server Error' }); }
+});
+app.get('/admin/rejected-webhooks', async (req, res) => {
+    if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
+    try {
+        const keys = await store.scanKeys('rejected_webhook:*');
+        const redis = await getRedis();
+        const results = [];
+        for (const k of keys) {
+            const val = await redis.get(k);
+            if (val) {
+                try {
+                    results.push(JSON.parse(val));
+                } catch {
+                    results.push({ key: k, error: 'Invalid JSON' });
+                }
+            }
+        }
+        res.json({ count: results.length, webhooks: results });
+    } catch (error) {
+        console.error('Error fetching rejected webhooks', error.message);
+        res.status(500).send('Internal Server Error');
+    }
 });
 app.get('/cron/sweep-unmatched', async (req, res) => {
     if (!authorized(req, CRON_SECRET)) return res.status(401).send('Unauthorized');

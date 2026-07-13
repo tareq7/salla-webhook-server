@@ -137,9 +137,20 @@ async function getMerchantToken(merchantId) {
     return data ? decryptJson(data) : null;
 }
 
+const REJECTED_TTL_SECONDS = 60 * 60 * 24;
+const rejectedKey = id => key('rejected_webhook', id);
+
+async function saveRejectedWebhook(orderId, payload) {
+    const client = await getRedis();
+    await client.set(rejectedKey(orderId), JSON.stringify({
+        payload,
+        timestamp: Date.now()
+    }), { EX: REJECTED_TTL_SECONDS });
+}
+
 module.exports = {
     saveTracking, getTrackingForOrder, deleteTrackingForOrder,
     saveOrderDetails, getOrderDetails, deleteOrderDetails, getOrderIdByCartId,
     claimConversion, releaseConversionClaim, markConversionSent, scanKeys,
-    saveMerchantToken, getMerchantToken
+    saveMerchantToken, getMerchantToken, saveRejectedWebhook
 };
