@@ -45,7 +45,9 @@
         return typeof value === 'string' &&
             value.length > 0 &&
             value.length <= maxLength &&
-            /^[A-Za-z0-9._~-]+$/.test(value);
+            /^[A-Za-z0-9._~-]+$/.test(value) &&
+            !value.startsWith('ory_at_') &&
+            !value.startsWith('ory_rt_');
     }
 
     function getClickDataFromUrl() {
