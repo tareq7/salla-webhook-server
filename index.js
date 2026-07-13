@@ -150,7 +150,11 @@ app.post('/webhook', async (req, res) => {
         if (!validIdentifier(orderId, 128)) return res.status(400).send('Invalid order ID');
         webhookLogs.push({ timestamp: new Date().toISOString(), event: payload.event, order_id: orderId });
         if (webhookLogs.length > 100) webhookLogs.shift();
-        const paid = String(order.status?.slug || order.status?.name || order.payment_status || '').toLowerCase() === 'paid';
+        const statusSlug = String(order.status?.slug || '').toLowerCase();
+        const paid = statusSlug !== 'payment_pending' &&
+                     statusSlug !== 'canceled' &&
+                     statusSlug !== 'cancelled' &&
+                     order.is_pending_payment === false;
         if (['order.created', 'order.payment.updated'].includes(payload.event) && paid) {
             order.e164Phone = normalizePhone(order.customer?.mobile);
             const cartId = order.cart_id ? String(order.cart_id) : null;
