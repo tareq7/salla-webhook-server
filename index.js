@@ -173,6 +173,20 @@ app.post('/webhook', async (req, res) => {
 app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 app.get('/readyz', async (req, res) => { try { await (await getRedis()).ping(); res.json({ status: 'ready' }); } catch { res.status(503).json({ status: 'not-ready' }); } });
 app.get('/admin/logs', (req, res) => authorized(req, ADMIN_SECRET) ? res.json({ count: webhookLogs.length, logs: webhookLogs }) : res.status(401).send('Unauthorized'));
+app.get('/admin/raw-dump', async (req, res) => {
+    if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
+    try {
+        const redis = await getRedis();
+        const clicks = await store.scanKeys('gclid:*');
+        const dump = {};
+        for (const c of clicks) {
+            try { dump[c] = JSON.parse(await redis.get(c)); } catch(e) { dump[c] = await redis.get(c); }
+        }
+        res.json({ status: 'success', total: clicks.length, data: dump });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 app.get('/admin/db-status', async (req, res) => {
     if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
     try {
