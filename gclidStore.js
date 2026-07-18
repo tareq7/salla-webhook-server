@@ -74,10 +74,16 @@ async function getOrderIdByCartId(cartId) {
 
 async function claimConversion(transactionId) {
     const redis = await getRedis();
-    if (await redis.exists(sentKey(transactionId))) return null;
     const owner = crypto.randomUUID();
-    const result = await redis.set(processingKey(transactionId), owner, { NX: true, EX: PROCESSING_TTL_SECONDS });
-    return result ? owner : null;
+    const result = await redis.eval(
+        "if redis.call('exists', KEYS[1]) == 1 then return 0 end; " +
+        "if redis.call('set', KEYS[2], ARGV[1], 'NX', 'EX', ARGV[2]) then return 1 else return 0 end",
+        {
+            keys: [sentKey(transactionId), processingKey(transactionId)],
+            arguments: [owner, String(PROCESSING_TTL_SECONDS)]
+        }
+    );
+    return result === 1 ? owner : null;
 }
 
 async function releaseConversionClaim(transactionId, owner) {

@@ -1,0 +1,245 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const Module = require('node:module');
+
+const tests = [];
+function test(name, fn) { tests.push({ name, fn }); }
+
+function makeStorage(initial = {}) {
+    const values = new Map(Object.entries(initial));
+    return {
+        getItem: key => values.has(key) ? values.get(key) : null,
+        setItem: (key, value) => values.set(key, String(value)),
+        removeItem: key => values.delete(key),
+        dump: () => Object.fromEntries(values)
+    };
+}
+
+function loadIndex(storeOverrides = {}) {
+    process.env.SALLA_WEBHOOK_SECRET = 'test-webhook-secret';
+    process.env.ADMIN_SECRET = 'test-admin-secret';
+    process.env.CRON_SECRET = 'test-cron-secret';
+
+    const routes = [];
+    const middlewares = [];
+    const app = {
+        disable() {}, set() {},
+        use(...args) { middlewares.push(args); },
+        post(path, ...handlers) { routes.push({ method: 'POST', path, handlers }); },
+        get(path, ...handlers) { routes.push({ method: 'GET', path, handlers }); },
+        listen() { throw new Error('listen should not run during tests'); }
+    };
+    const expressMock = function () { return app; };
+    expressMock.text = options => ({ parser: 'text', options });
+    expressMock.raw = options => ({ parser: 'raw', options });
+    const rateLimitMock = () => (req, res, next) => next();
+    const storeMock = {
+        claimConversion: async () => null,
+        releaseConversionClaim: async () => {},
+        markConversionSent: async () => {},
+        deleteTrackingForOrder: async () => {},
+        deleteOrderDetails: async () => {},
+        getTrackingForOrder: async () => null,
+        getOrderDetails: async () => null,
+        ...storeOverrides
+    };
+    const redisMock = { getRedis: async () => ({}), closeRedis: async () => {} };
+
+    const originalLoad = Module._load;
+    Module._load = function (request, parent, isMain) {
+        if (request === 'express') return expressMock;
+        if (request === 'express-rate-limit') return rateLimitMock;
+        if (request === './gclidStore') return storeMock;
+        if (request === './redis') return redisMock;
+        return originalLoad.call(this, request, parent, isMain);
+    };
+    const file = require.resolve('../index.js');
+    delete require.cache[file];
+    try {
+        return { exported: require(file), app, routes, middlewares, storeMock };
+    } finally {
+        Module._load = originalLoad;
+        delete require.cache[file];
+    }
+}
+
+test('identifier validation matches tracker contract', () => {
+    const { exported } = loadIndex();
+    assert.equal(exported.validIdentifier('abc.DEF_123-~', 256), true);
+    assert.equal(exported.validIdentifier('', 256), false);
+    assert.equal(exported.validIdentifier('contains space', 256), false);
+    assert.equal(exported.validIdentifier('x'.repeat(257), 256), false);
+});
+
+test('phone normalization handles common Saudi formats', () => {
+    const { exported } = loadIndex();
+    assert.equal(exported.normalizePhone('050 123 4567'), '+966501234567');
+    assert.equal(exported.normalizePhone('501234567'), '+966501234567');
+    assert.equal(exported.normalizePhone('00966501234567'), '+966501234567');
+    assert.equal(exported.normalizePhone('abc'), null);
+});
+
+test('conversion cleanup failure does not report a sent conversion as failed', async () => {
+    const calls = [];
+    const { exported } = loadIndex({
+        claimConversion: async () => 'owner',
+        markConversionSent: async () => calls.push('marked'),
+        deleteTrackingForOrder: async () => { throw new Error('cleanup failed'); },
+        deleteOrderDetails: async () => calls.push('details-deleted'),
+        releaseConversionClaim: async () => calls.push('released')
+    });
+    const oldFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 204 });
+    try {
+        assert.equal(await exported.processConversion('123', null, { clientId: '1.2' }, {
+            reference_id: 10,
+            amounts: { total: { amount: 5 } },
+            currency: 'SAR',
+            customer: {}
+        }), true);
+        assert.deepEqual(calls, ['marked', 'details-deleted']);
+    } finally {
+        global.fetch = oldFetch;
+    }
+});
+
+test('conversion failure releases the claim', async () => {
+    const calls = [];
+    const { exported } = loadIndex({
+        claimConversion: async () => 'owner',
+        releaseConversionClaim: async () => calls.push('released')
+    });
+    const oldFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 500 });
+    try {
+        await assert.rejects(() => exported.processConversion('123', null, null, {
+            reference_id: 10,
+            amounts: { total: { amount: 5 } },
+            currency: 'SAR',
+            customer: {}
+        }), /sGTM returned 500/);
+        assert.deepEqual(calls, ['released']);
+    } finally {
+        global.fetch = oldFetch;
+    }
+});
+
+
+test('conversion claim atomically checks sent marker and acquires processing lock', async () => {
+    let evalCall;
+    const redis = {
+        eval: async (script, options) => {
+            evalCall = { script, options };
+            return 1;
+        }
+    };
+    const originalLoad = Module._load;
+    Module._load = function (request, parent, isMain) {
+        if (request === './redis.js') return { getRedis: async () => redis };
+        return originalLoad.call(this, request, parent, isMain);
+    };
+    const file = require.resolve('../gclidStore.js');
+    delete require.cache[file];
+    try {
+        const store = require(file);
+        const owner = await store.claimConversion('123');
+        assert.match(owner, /^[0-9a-f-]{36}$/i);
+        assert.match(evalCall.script, /exists/);
+        assert.match(evalCall.script, /'NX'/);
+        assert.deepEqual(evalCall.options.keys, ['sent:123', 'processing:123']);
+        assert.equal(evalCall.options.arguments[0], owner);
+        assert.equal(evalCall.options.arguments[1], '60');
+    } finally {
+        Module._load = originalLoad;
+        delete require.cache[file];
+    }
+});
+
+test('tracker sends order-only text/plain payload and clears click after success', async () => {
+    const localStorage = makeStorage();
+    const sessionStorage = makeStorage();
+    let tracker;
+    let request;
+    const context = {
+        window: {
+            location: { search: '?gclid=test-click-123', href: 'https://ssp-1.com/?gclid=test-click-123' },
+            localStorage,
+            sessionStorage,
+            Salla: {
+                onReady: cb => cb(),
+                analytics: { registerTracker: value => { tracker = value; } }
+            }
+        },
+        document: { cookie: '_ga=GA1.1.123456789.1700000000' },
+        URLSearchParams,
+        console: { log() {}, warn() {}, error() {} },
+        setTimeout,
+        fetch: async (url, options) => {
+            request = { url, options };
+            return { ok: true, status: 200 };
+        },
+        Promise
+    };
+    context.window.window = context.window;
+    vm.runInNewContext(fs.readFileSync(require.resolve('../tracker.js'), 'utf8'), context);
+    assert.ok(tracker);
+    assert.ok(localStorage.getItem('pending_google_ads_click'));
+    tracker.track('Cart Updated', { cart: { id: 'old-cart' } });
+    assert.equal(request, undefined);
+    tracker.track('Order Completed', { order: { id: 1671795666 } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(request.url, 'https://track.ssp-1.com/track-gclid');
+    assert.equal(request.options.headers['Content-Type'], 'text/plain;charset=UTF-8');
+    assert.deepEqual(JSON.parse(request.options.body), {
+        entity_type: 'order',
+        entity_id: '1671795666',
+        tracking_id: 'test-click-123',
+        tracking_type: 'gclid',
+        client_id: '123456789.1700000000'
+    });
+    assert.equal(localStorage.getItem('pending_google_ads_click'), null);
+});
+
+test('tracker preserves click after server failure', async () => {
+    const click = JSON.stringify({ tracking_id: 'test-click-456', tracking_type: 'gclid', captured_at: Date.now() });
+    const localStorage = makeStorage({ pending_google_ads_click: click });
+    let tracker;
+    const context = {
+        window: {
+            location: { search: '', href: 'https://ssp-1.com/thank-you' },
+            localStorage,
+            sessionStorage: makeStorage(),
+            Salla: {
+                onReady: cb => cb(),
+                analytics: { registerTracker: value => { tracker = value; } }
+            }
+        },
+        document: { cookie: '' }, URLSearchParams,
+        console: { log() {}, warn() {}, error() {} }, setTimeout,
+        fetch: async () => ({ ok: false, status: 500 }), Promise
+    };
+    context.window.window = context.window;
+    vm.runInNewContext(fs.readFileSync(require.resolve('../tracker.js'), 'utf8'), context);
+    tracker.track('Order Completed', { data: { id: 99 } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(localStorage.getItem('pending_google_ads_click'), click);
+});
+
+(async () => {
+    let failures = 0;
+    for (const item of tests) {
+        try {
+            await item.fn();
+            console.log('ok -', item.name);
+        } catch (error) {
+            failures++;
+            console.error('not ok -', item.name);
+            console.error(error.stack || error);
+        }
+    }
+    if (failures) process.exitCode = 1;
+    else console.log(`\n${tests.length} tests passed`);
+})();

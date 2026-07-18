@@ -22,11 +22,14 @@ const ALLOWED_ORIGINS = new Set((process.env.ALLOWED_ORIGINS || '').split(',').m
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-app.use('/track-gclid', express.text({ type: 'text/plain', limit: '4kb' }));
+app.use('/track-gclid', express.text({ type: ['text/plain', 'application/json'], limit: '4kb' }));
 app.use('/webhook', express.raw({ type: 'application/json', limit: '1mb' }));
 app.use((req, res, next) => {
     const origin = req.headers.origin;
-    if (origin && (ALLOWED_ORIGINS.size === 0 || ALLOWED_ORIGINS.has(origin))) {
+    if (origin && ALLOWED_ORIGINS.size > 0 && !ALLOWED_ORIGINS.has(origin)) {
+        return res.status(403).send('Origin not allowed');
+    }
+    if (origin) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Vary', 'Origin');
     }
@@ -90,16 +93,26 @@ async function sendToSgtm(orderId, tracking, order) {
 async function processConversion(orderId, cartId, tracking, order) {
     const owner = await store.claimConversion(orderId);
     if (!owner) return false;
+    let sent = false;
     try {
         await sendToSgtm(orderId, tracking, order);
         await store.markConversionSent(orderId, owner);
-        await store.deleteTrackingForOrder(orderId, cartId);
-        await store.deleteOrderDetails(orderId);
-        return true;
+        sent = true;
     } catch (error) {
         await store.releaseConversionClaim(orderId, owner).catch(releaseError => console.error('Claim release failed', releaseError.message));
         throw error;
     }
+
+    const cleanupResults = await Promise.allSettled([
+        store.deleteTrackingForOrder(orderId, cartId),
+        store.deleteOrderDetails(orderId)
+    ]);
+    for (const result of cleanupResults) {
+        if (result.status === 'rejected') {
+            console.error('Post-conversion cleanup failed', result.reason?.message || result.reason);
+        }
+    }
+    return sent;
 }
 
 async function reconcile(orderId, cartId) {
@@ -110,7 +123,7 @@ async function reconcile(orderId, cartId) {
 
 app.post('/track-gclid', trackLimiter, async (req, res) => {
     try {
-        const body = JSON.parse(req.body || '');
+        const body = typeof req.body === 'string' ? JSON.parse(req.body || '') : req.body;
         const { entity_type: type, entity_id: id, tracking_id: trackingId, tracking_type: trackingType, client_id: clientId } = body;
         if (!['cart', 'order'].includes(type)) return res.status(400).send('Invalid entity type');
         if (!validIdentifier(id, 128)) return res.status(400).send('Invalid entity ID');
@@ -156,9 +169,9 @@ app.post('/webhook', async (req, res) => {
                      statusSlug !== 'cancelled' &&
                      order.is_pending_payment === false;
         if (['order.created', 'order.payment.updated'].includes(payload.event) && paid) {
-            order.e164Phone = normalizePhone(order.customer?.mobile);
-            const cartId = order.cart_id ? String(order.cart_id) : null;
-            await store.saveOrderDetails(orderId, cartId, order);
+            const storedOrder = { ...order, e164Phone: normalizePhone(order.customer?.mobile) };
+            const cartId = order.cart_id ? String(order.cart_id) : (order.checkout_id ? String(order.checkout_id) : null);
+            await store.saveOrderDetails(orderId, cartId, storedOrder);
             await reconcile(orderId, cartId); // write then re-read closes the lost-wakeup race
         } else {
             await store.saveRejectedWebhook(orderId, payload);
@@ -262,4 +275,4 @@ if (require.main === module) {
     server = app.listen(process.env.PORT || 3000, () => console.log(`Server listening on port ${process.env.PORT || 3000}`));
     process.on('SIGTERM', () => server.close(async () => { await closeRedis(); process.exit(0); }));
 }
-module.exports = { app, authorized, normalizePhone, reconcile, processConversion, sendToSgtm, getSallaAccessToken };
+module.exports = { app, authorized, normalizePhone, validIdentifier, reconcile, processConversion, sendToSgtm, getSallaAccessToken };
