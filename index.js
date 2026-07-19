@@ -280,7 +280,21 @@ app.post('/admin/snapshot', async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+app.use('/admin/force-push', express.json({ limit: '4kb' }));
+app.post('/admin/force-push', async (req, res) => {
+    if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
+    try {
+        const { order_id: orderId } = req.body || {};
+        if (!validIdentifier(orderId, 128)) return res.status(400).send('Invalid order ID');
+        const order = await store.getOrderDetails(orderId);
+        if (!order) return res.status(404).send('Order details not found');
+        await sendToSgtm(orderId, null, order);
+        res.json({ status: 'success', message: `Order ${orderId} forced to sGTM` });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 async function getSallaAccessToken(merchantId) {
+
 
 
     for (let attempt = 0; attempt < 10; attempt++) {
