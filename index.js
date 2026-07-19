@@ -245,8 +245,23 @@ app.get('/cron/sweep-unmatched', async (req, res) => {
         res.json({ status: 'success', swept });
     } catch (error) { console.error('Sweep error', error.message); res.status(500).json({ error: 'Internal Server Error' }); }
 });
+app.use('/admin/delete-keys', express.json({ limit: '4kb' }));
+app.post('/admin/delete-keys', async (req, res) => {
+    if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
+    try {
+        const redis = await getRedis();
+        const keys = Array.isArray(req.body) ? req.body : [];
+        if (!keys.length) return res.status(400).json({ error: 'Provide an array of key names' });
+        let deleted = 0;
+        for (const key of keys) {
+            if (typeof key === 'string' && key.length < 256) { deleted += await redis.del(key); }
+        }
+        res.json({ status: 'success', deleted });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+});
 
 async function getSallaAccessToken(merchantId) {
+
     for (let attempt = 0; attempt < 10; attempt++) {
         const token = await store.getMerchantToken(merchantId);
         if (!token) throw new Error(`No token for merchant ${merchantId}`);
