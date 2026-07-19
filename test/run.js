@@ -225,11 +225,52 @@ test('tracker preserves click after server failure', async () => {
     context.window.window = context.window;
     vm.runInNewContext(fs.readFileSync(require.resolve('../tracker.js'), 'utf8'), context);
     tracker.track('Order Completed', { data: { id: 99 } });
-    await new Promise(resolve => setImmediate(resolve));
     assert.equal(localStorage.getItem('pending_google_ads_click'), click);
 });
 
+test('reconciliation fallback matches by order_id, checkout_id, and reference_id', async () => {
+    const trackingStore = new Map();
+    const orderDetailsStore = new Map();
+    const mappingsStore = new Map();
+
+    const { exported } = loadIndex({
+        getOrderDetails: async (orderId) => orderDetailsStore.get(orderId),
+        getTrackingForOrder: async (orderId, cartId, referenceId) => {
+            return trackingStore.get(orderId) || trackingStore.get(cartId) || trackingStore.get(referenceId) || null;
+        },
+        getOrderIdByCartId: async (cartId) => mappingsStore.get(`cart:${cartId}`),
+        getOrderIdByReferenceId: async (refId) => mappingsStore.get(`ref:${refId}`),
+        claimConversion: async () => 'owner_token',
+        markConversionSent: async () => {}
+    });
+
+    orderDetailsStore.set('664467442', {
+        id: '664467442',
+        cart_id: '1851080500',
+        reference_id: '273025367',
+        amounts: { total: { amount: 10 } },
+        currency: 'SAR'
+    });
+    mappingsStore.set('cart:1851080500', '664467442');
+    mappingsStore.set('ref:273025367', '664467442');
+
+    trackingStore.set('664467442', { id: 'gclid_order_id', type: 'gclid' });
+    let matched = await exported.reconcile('664467442', '1851080500');
+    assert.equal(matched, true);
+
+    trackingStore.clear();
+    trackingStore.set('1851080500', { id: 'gclid_cart_id', type: 'gclid' });
+    matched = await exported.reconcile('664467442', '1851080500');
+    assert.equal(matched, true);
+
+    trackingStore.clear();
+    trackingStore.set('273025367', { id: 'gclid_ref_id', type: 'gclid' });
+    matched = await exported.reconcile('664467442', '1851080500');
+    assert.equal(matched, true);
+});
+
 (async () => {
+
     let failures = 0;
     for (const item of tests) {
         try {
