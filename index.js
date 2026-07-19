@@ -260,7 +260,28 @@ app.post('/admin/delete-keys', async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+app.post('/admin/snapshot', async (req, res) => {
+    if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
+    try {
+        const redis = await getRedis();
+        const prefixes = ['gclid:*', 'order_details:*', 'sent:*', 'cart_to_order:*', 'rejected_webhook:*', 'merchant_token:*', 'processing:*'];
+        const snapshot = { created_at: new Date().toISOString(), data: {} };
+        for (const pattern of prefixes) {
+            const keys = await store.scanKeys(pattern);
+            for (const key of keys) {
+                const raw = await redis.get(key);
+                try { snapshot.data[key] = JSON.parse(raw); } catch { snapshot.data[key] = raw; }
+            }
+        }
+        snapshot.total_keys = Object.keys(snapshot.data).length;
+        const snapshotKey = `snapshot:${Date.now()}`;
+        await redis.set(snapshotKey, JSON.stringify(snapshot), { EX: 60 * 60 * 24 * 30 });
+        res.json({ status: 'success', snapshot_key: snapshotKey, total_keys: snapshot.total_keys, data: snapshot.data });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 async function getSallaAccessToken(merchantId) {
+
 
     for (let attempt = 0; attempt < 10; attempt++) {
         const token = await store.getMerchantToken(merchantId);
