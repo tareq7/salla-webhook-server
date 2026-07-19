@@ -35,6 +35,7 @@ function loadIndex(storeOverrides = {}) {
     const expressMock = function () { return app; };
     expressMock.text = options => ({ parser: 'text', options });
     expressMock.raw = options => ({ parser: 'raw', options });
+    expressMock.json = options => ({ parser: 'json', options });
     const rateLimitMock = () => (req, res, next) => next();
     const storeMock = {
         claimConversion: async () => null,

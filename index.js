@@ -104,7 +104,7 @@ async function processConversion(orderId, cartId, tracking, order) {
     }
 
     const cleanupResults = await Promise.allSettled([
-        store.deleteTrackingForOrder(orderId, cartId),
+        store.deleteTrackingForOrder(orderId, cartId, order.reference_id ? String(order.reference_id) : null),
         store.deleteOrderDetails(orderId)
     ]);
     for (const result of cleanupResults) {
@@ -116,8 +116,10 @@ async function processConversion(orderId, cartId, tracking, order) {
 }
 
 async function reconcile(orderId, cartId) {
-    const [tracking, order] = await Promise.all([store.getTrackingForOrder(orderId, cartId), store.getOrderDetails(orderId)]);
-    if (!tracking || !order) return false;
+    const order = await store.getOrderDetails(orderId);
+    if (!order) return false;
+    const tracking = await store.getTrackingForOrder(orderId, cartId, order.reference_id ? String(order.reference_id) : null);
+    if (!tracking) return false;
     return processConversion(orderId, cartId, tracking, order);
 }
 
@@ -131,7 +133,21 @@ app.post('/track-gclid', trackLimiter, async (req, res) => {
         if (!['gclid', 'wbraid', 'gbraid'].includes(trackingType)) return res.status(400).send('Invalid tracking type');
         if (clientId != null && !validIdentifier(clientId, 100)) return res.status(400).send('Invalid client ID');
         await store.saveTracking(type, id, { tracking_id: trackingId, tracking_type: trackingType, client_id: clientId });
-        const orderId = type === 'order' ? id : await store.getOrderIdByCartId(id);
+        
+        let orderId = null;
+        if (type === 'order') {
+            if (await store.getOrderDetails(id)) {
+                orderId = id;
+            } else {
+                orderId = await store.getOrderIdByCartId(id);
+                if (!orderId) {
+                    orderId = await store.getOrderIdByReferenceId(id);
+                }
+            }
+        } else {
+            orderId = await store.getOrderIdByCartId(id);
+        }
+        
         const matched = orderId ? await reconcile(String(orderId), type === 'cart' ? id : null) : false;
         res.status(200).json({ status: 'stored', matched });
     } catch (error) {

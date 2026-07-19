@@ -11,6 +11,7 @@ const key = (namespace, id) => `${namespace}:${id}`;
 const cartGclidKey = id => key('gclid:cart', id);
 const orderGclidKey = id => key('gclid:order', id);
 const cartToOrderKey = id => key('cart_to_order', id);
+const referenceToOrderKey = id => key('reference_to_order', id);
 const orderDetailsKey = id => key('order_details', id);
 const sentKey = id => key('sent', id);
 const processingKey = id => key('processing', id);
@@ -33,18 +34,28 @@ async function saveTracking(entityType, entityId, trackingData) {
     }), { EX: DATA_TTL_SECONDS });
 }
 
-async function getTrackingForOrder(orderId, cartId) {
+async function getTrackingForOrder(orderId, cartId, referenceId) {
     const client = await getRedis();
     const orderValue = await client.get(orderGclidKey(orderId));
     if (orderValue) return parseJson(orderValue, orderGclidKey(orderId));
-    if (!cartId) return null;
-    return parseJson(await client.get(cartGclidKey(cartId)), cartGclidKey(cartId));
+    if (cartId) {
+        const cartValue = await client.get(cartGclidKey(cartId));
+        if (cartValue) return parseJson(cartValue, cartGclidKey(cartId));
+        const cartOrderValue = await client.get(orderGclidKey(cartId));
+        if (cartOrderValue) return parseJson(cartOrderValue, orderGclidKey(cartId));
+    }
+    if (referenceId) {
+        const refValue = await client.get(orderGclidKey(referenceId));
+        if (refValue) return parseJson(refValue, orderGclidKey(referenceId));
+    }
+    return null;
 }
 
-async function deleteTrackingForOrder(orderId, cartId) {
+async function deleteTrackingForOrder(orderId, cartId, referenceId) {
     const client = await getRedis();
     const keys = [orderGclidKey(orderId)];
-    if (cartId) keys.push(cartGclidKey(cartId), cartToOrderKey(cartId));
+    if (cartId) keys.push(cartGclidKey(cartId), cartToOrderKey(cartId), orderGclidKey(cartId));
+    if (referenceId) keys.push(orderGclidKey(referenceId), referenceToOrderKey(referenceId));
     await client.del(keys);
 }
 
@@ -54,6 +65,7 @@ async function saveOrderDetails(orderId, cartId, details) {
     const commands = client.multi()
         .set(orderDetailsKey(orderId), JSON.stringify(stored), { EX: DATA_TTL_SECONDS });
     if (cartId) commands.set(cartToOrderKey(cartId), String(orderId), { EX: DATA_TTL_SECONDS });
+    if (details.reference_id) commands.set(referenceToOrderKey(String(details.reference_id)), String(orderId), { EX: DATA_TTL_SECONDS });
     await commands.exec();
     return stored;
 }
@@ -70,6 +82,10 @@ async function deleteOrderDetails(orderId) {
 
 async function getOrderIdByCartId(cartId) {
     return (await getRedis()).get(cartToOrderKey(cartId));
+}
+
+async function getOrderIdByReferenceId(referenceId) {
+    return (await getRedis()).get(referenceToOrderKey(referenceId));
 }
 
 async function claimConversion(transactionId) {
@@ -156,7 +172,7 @@ async function saveRejectedWebhook(orderId, payload) {
 
 module.exports = {
     saveTracking, getTrackingForOrder, deleteTrackingForOrder,
-    saveOrderDetails, getOrderDetails, deleteOrderDetails, getOrderIdByCartId,
+    saveOrderDetails, getOrderDetails, deleteOrderDetails, getOrderIdByCartId, getOrderIdByReferenceId,
     claimConversion, releaseConversionClaim, markConversionSent, scanKeys,
     saveMerchantToken, getMerchantToken, saveRejectedWebhook
 };
