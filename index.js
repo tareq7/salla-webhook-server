@@ -336,6 +336,14 @@ async function getSallaAccessToken(merchantId) {
     throw new Error(`Token refresh timed out for merchant ${merchantId}`);
 }
 
+app.use((err, req, res, _next) => {
+    if (err.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Invalid JSON body' });
+    }
+    console.error(`Unhandled error on ${req.method} ${req.path}:`, err.message);
+    res.status(500).send('Internal Server Error');
+});
+
 let server;
 if (require.main === module) {
     server = app.listen(process.env.PORT || 3000, () => console.log(`Server listening on port ${process.env.PORT || 3000}`));
