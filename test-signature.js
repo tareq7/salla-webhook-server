@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 
-const SECRET = process.env.SALLA_WEBHOOK_SECRET || 'efb67e53e47def3544de8d71c3532617cab5d3f791f370acd3e986d38e579616';
+const SECRET = process.env.SALLA_WEBHOOK_SECRET;
+if (!SECRET) throw new Error('SALLA_WEBHOOK_SECRET is required');
 const ENDPOINT = 'http://localhost:3000/webhook';
 
 const samplePayload = JSON.stringify({

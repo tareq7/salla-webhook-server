@@ -13,6 +13,7 @@ const required = name => {
 const SALLA_SECRET = required('SALLA_WEBHOOK_SECRET');
 const ADMIN_SECRET = required('ADMIN_SECRET');
 const CRON_SECRET = required('CRON_SECRET');
+const OBSERVATORY_SECRET = required('OBSERVATORY_SECRET');
 const SGTM_URL = new URL(process.env.SGTM_URL || 'https://server-side-tagging-ihka65rwnq-uc.a.run.app').origin;
 const GA4_MEASUREMENT_ID = process.env.GA4_MEASUREMENT_ID || 'G-KBLW70T89R';
 const SALLA_CLIENT_ID = process.env.SALLA_CLIENT_ID || '';
@@ -52,6 +53,31 @@ function authorized(req, secret) {
     const supplied = Buffer.from(header.slice(7));
     const expected = Buffer.from(secret);
     return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+function buildReconciliationStates(sentKeys, clickKeys, orderKeys, rejectedKeys = []) {
+    const idsFromKeys = (keys, prefix) => new Set(keys.flatMap(value => {
+        if (typeof value !== 'string' || !value.startsWith(prefix)) return [];
+        const orderId = value.slice(prefix.length);
+        return /^\d+$/.test(orderId) ? [orderId] : [];
+    }));
+    const sent = idsFromKeys(sentKeys, 'sent:');
+    const clicks = idsFromKeys(clickKeys, 'gclid:order:');
+    const orders = idsFromKeys(orderKeys, 'order_details:');
+    const rejected = idsFromKeys(rejectedKeys, 'rejected_webhook:');
+    const ids = new Set([...sent, ...clicks, ...orders, ...rejected]);
+    const states = {};
+    for (const orderId of ids) {
+        states[orderId] = sent.has(orderId)
+            ? 'matched'
+            : clicks.has(orderId) && orders.has(orderId)
+                ? 'processing_pending'
+                : orders.has(orderId)
+                    ? 'browser_pending'
+                    : rejected.has(orderId)
+                        ? 'webhook_rejected'
+                        : 'webhook_pending';
+    }
+    return states;
 }
 function normalizePhone(phone) {
     if (!phone) return null;
@@ -201,6 +227,24 @@ app.post('/webhook', async (req, res) => {
 
 app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 app.get('/readyz', async (req, res) => { try { await (await getRedis()).ping(); res.json({ status: 'ready' }); } catch { res.status(503).json({ status: 'not-ready' }); } });
+app.get('/internal/reconciliation', async (req, res) => {
+    if (!authorized(req, OBSERVATORY_SECRET)) return res.status(401).send('Unauthorized');
+    try {
+        const [sentKeys, clickKeys, orderKeys, rejectedKeys] = await Promise.all([
+            store.scanKeys('sent:*'),
+            store.scanKeys('gclid:order:*'),
+            store.scanKeys('order_details:*'),
+            store.scanKeys('rejected_webhook:*')
+        ]);
+        return res.json({
+            status: 'success',
+            states: buildReconciliationStates(sentKeys, clickKeys, orderKeys, rejectedKeys)
+        });
+    } catch (error) {
+        console.error('Reconciliation snapshot failed', error.message);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
 app.get('/admin/logs', (req, res) => authorized(req, ADMIN_SECRET) ? res.json({ count: webhookLogs.length, logs: webhookLogs }) : res.status(401).send('Unauthorized'));
 app.get('/admin/raw-dump', async (req, res) => {
     if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
@@ -349,4 +393,4 @@ if (require.main === module) {
     server = app.listen(process.env.PORT || 3000, () => console.log(`Server listening on port ${process.env.PORT || 3000}`));
     process.on('SIGTERM', () => server.close(async () => { await closeRedis(); process.exit(0); }));
 }
-module.exports = { app, authorized, normalizePhone, validIdentifier, reconcile, processConversion, sendToSgtm, getSallaAccessToken };
+module.exports = { app, authorized, buildReconciliationStates, normalizePhone, validIdentifier, reconcile, processConversion, sendToSgtm, getSallaAccessToken };

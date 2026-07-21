@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "check": "node --check index.js && node --check gclidStore.js && node --check redis.js && node --check setup-sgtm.js",
-    "test": "node --test"
+    "test": "node --test test/run.js"
   },
   "engines": { "node": ">=20" },
   "dependencies": {

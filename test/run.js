@@ -22,6 +22,7 @@ function loadIndex(storeOverrides = {}) {
     process.env.SALLA_WEBHOOK_SECRET = 'test-webhook-secret';
     process.env.ADMIN_SECRET = 'test-admin-secret';
     process.env.CRON_SECRET = 'test-cron-secret';
+    process.env.OBSERVATORY_SECRET = 'test-observatory-secret';
 
     const routes = [];
     const middlewares = [];
@@ -45,6 +46,7 @@ function loadIndex(storeOverrides = {}) {
         deleteOrderDetails: async () => {},
         getTrackingForOrder: async () => null,
         getOrderDetails: async () => null,
+        scanKeys: async () => [],
         ...storeOverrides
     };
     const redisMock = { getRedis: async () => ({}), closeRedis: async () => {} };
@@ -81,6 +83,59 @@ test('phone normalization handles common Saudi formats', () => {
     assert.equal(exported.normalizePhone('501234567'), '+966501234567');
     assert.equal(exported.normalizePhone('00966501234567'), '+966501234567');
     assert.equal(exported.normalizePhone('abc'), null);
+});
+
+test('reconciliation states preserve lifecycle meaning and matched precedence', () => {
+    const { exported } = loadIndex();
+    assert.deepEqual(exported.buildReconciliationStates(
+        ['sent:123', 'sent:invalid:id'],
+        ['gclid:order:123', 'gclid:order:456', 'gclid:order:999', 'gclid:order:111'],
+        ['order_details:123', 'order_details:789', 'order_details:999'],
+        ['rejected_webhook:123', 'rejected_webhook:111', 'rejected_webhook:222']
+    ), {
+        123: 'matched',
+        456: 'webhook_pending',
+        789: 'browser_pending',
+        999: 'processing_pending',
+        111: 'webhook_rejected',
+        222: 'webhook_rejected'
+    });
+});
+
+test('reconciliation endpoint exposes status only to the dedicated observer', async () => {
+    const keys = {
+        'sent:*': ['sent:123'],
+        'gclid:order:*': ['gclid:order:456'],
+        'order_details:*': ['order_details:789'],
+        'rejected_webhook:*': ['rejected_webhook:999']
+    };
+    const { routes } = loadIndex({ scanKeys: async pattern => keys[pattern] || [] });
+    const route = routes.find(value => value.method === 'GET' && value.path === '/internal/reconciliation');
+    const createResponse = () => ({
+        statusCode: 200,
+        body: null,
+        status(code) { this.statusCode = code; return this; },
+        json(body) { this.body = body; return this; },
+        send(body) { this.body = body; return this; }
+    });
+    for (const headers of [{}, { authorization: 'Bearer wrong-secret' }]) {
+        const unauthorizedResponse = createResponse();
+        await route.handlers.at(-1)({ headers }, unauthorizedResponse);
+        assert.equal(unauthorizedResponse.statusCode, 401);
+        assert.equal(unauthorizedResponse.body, 'Unauthorized');
+    }
+    const response = createResponse();
+    await route.handlers.at(-1)({ headers: { authorization: 'Bearer test-observatory-secret' } }, response);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.body, {
+        status: 'success',
+        states: {
+            123: 'matched',
+            456: 'webhook_pending',
+            789: 'browser_pending',
+            999: 'webhook_rejected'
+        }
+    });
 });
 
 test('conversion cleanup failure does not report a sent conversion as failed', async () => {
