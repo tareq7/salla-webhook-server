@@ -348,8 +348,9 @@ app.post('/admin/force-push', async (req, res) => {
         if (!validIdentifier(orderId, 128)) return res.status(400).send('Invalid order ID');
         const order = await store.getOrderDetails(orderId);
         if (!order) return res.status(404).send('Order details not found');
-        await sendToSgtm(orderId, null, order);
-        res.json({ status: 'success', message: `Order ${orderId} forced to sGTM` });
+        const cartId = order.cart_id ? String(order.cart_id) : (order.checkout_id ? String(order.checkout_id) : null);
+        await processConversion(orderId, cartId, null, order);
+        res.json({ status: 'success', message: `Order ${orderId} forced to sGTM and marked as matched` });
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
