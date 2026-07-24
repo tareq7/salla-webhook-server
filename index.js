@@ -291,6 +291,17 @@ app.get('/admin/rejected-webhooks', async (req, res) => {
         res.status(500).send('Internal Server Error');
     }
 });
+app.get('/admin/merchant-token', async (req, res) => {
+    if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
+    try {
+        const keys = await store.scanKeys('merchant_token:*');
+        const merchantIds = keys.map(k => k.replace('merchant_token:', ''));
+        const targetId = req.query.merchant_id || merchantIds[0];
+        if (!targetId) return res.status(404).json({ error: 'No merchant tokens found' });
+        const token = await store.getMerchantToken(targetId);
+        res.json({ status: 'success', merchant_id: targetId, available_merchants: merchantIds, token });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+});
 app.get('/cron/sweep-unmatched', async (req, res) => {
     if (!authorized(req, CRON_SECRET)) return res.status(401).send('Unauthorized');
     try {
