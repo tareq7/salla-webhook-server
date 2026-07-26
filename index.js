@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const store = require('./gclidStore');
 const { getRedis, closeRedis } = require('./redis');
+const { deliver: deliverToSgtm } = require('./sgtmDelivery');
 
 const required = name => {
     const value = process.env[name];
@@ -111,13 +112,19 @@ async function sendToSgtm(orderId, tracking, order) {
         'ep.user_data.address.country': order.customer?.country?.code || 'SA'
     };
     for (const [name, valuePart] of Object.entries(userData)) if (valuePart) params.set(name, valuePart);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
     try {
-        const response = await fetch(`${SGTM_URL}/g/collect?${params}`, { method: 'POST', signal: controller.signal });
-        if (!response.ok) throw new Error(`sGTM returned ${response.status}`);
-        console.log('Purchase sent to sGTM', { transactionId, attributed: Boolean(tracking?.id) });
-    } finally { clearTimeout(timeout); }
+        const result = await deliverToSgtm(`${SGTM_URL}/g/collect?${params}`);
+        console.log('Purchase sent to sGTM', {
+            transactionId, attributed: Boolean(tracking?.id),
+            attempts: result.attempts, status: result.status, durationMs: result.durationMs
+        });
+    } catch (error) {
+        console.error('sGTM delivery failed', {
+            transactionId, code: error.code || 'SGTM_UNKNOWN_ERROR',
+            status: error.status, attempts: error.attempts, retryable: error.retryable
+        });
+        throw error;
+    }
 }
 
 async function processConversion(orderId, cartId, tracking, order) {

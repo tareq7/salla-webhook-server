@@ -183,6 +183,74 @@ test('conversion failure releases the claim', async () => {
     }
 });
 
+test('sGTM delivery retries transient responses and reports the final attempt', async () => {
+    const { deliver } = require('../sgtmDelivery');
+    const statuses = [503, 429, 204];
+    const delays = [];
+    const result = await deliver('https://example.test/g/collect', {
+        fetchFn: async () => {
+            const status = statuses.shift();
+            return {
+                ok: status === 204,
+                status,
+                headers: { get: name => name === 'retry-after' && status === 429 ? '0.01' : null },
+                text: async () => 'temporarily unavailable'
+            };
+        },
+        sleep: async ms => delays.push(ms),
+        random: () => 0.5,
+        maxAttempts: 3,
+        timeoutMs: 1000,
+        baseDelayMs: 100,
+        maxDelayMs: 1000
+    });
+    assert.equal(result.attempts, 3);
+    assert.equal(result.status, 204);
+    assert.deepEqual(delays, [100, 10]);
+});
+
+test('sGTM delivery does not retry permanent client errors', async () => {
+    const { deliver } = require('../sgtmDelivery');
+    let calls = 0;
+    await assert.rejects(() => deliver('https://example.test/g/collect', {
+        fetchFn: async () => {
+            calls++;
+            return { ok: false, status: 400, headers: { get: () => null }, text: async () => 'bad request' };
+        },
+        sleep: async () => assert.fail('permanent errors must not sleep'),
+        maxAttempts: 3,
+        timeoutMs: 1000
+    }), error => {
+        assert.equal(error.code, 'SGTM_HTTP_ERROR');
+        assert.equal(error.status, 400);
+        assert.equal(error.attempts, 1);
+        return true;
+    });
+    assert.equal(calls, 1);
+});
+
+test('sGTM delivery retries network failures without leaking the request URL', async () => {
+    const { deliver } = require('../sgtmDelivery');
+    let calls = 0;
+    await assert.rejects(() => deliver('https://example.test/g/collect?ep.transaction_id=secret-order', {
+        fetchFn: async () => {
+            calls++;
+            throw new TypeError('fetch failed');
+        },
+        sleep: async () => {},
+        random: () => 0.5,
+        maxAttempts: 2,
+        timeoutMs: 1000,
+        baseDelayMs: 1
+    }), error => {
+        assert.equal(error.code, 'SGTM_NETWORK_ERROR');
+        assert.equal(error.attempts, 2);
+        assert.doesNotMatch(error.message, /secret-order/);
+        return true;
+    });
+    assert.equal(calls, 2);
+});
+
 
 test('conversion claim atomically checks sent marker and acquires processing lock', async () => {
     let evalCall;
@@ -309,19 +377,25 @@ test('reconciliation fallback matches by order_id, checkout_id, and reference_id
     mappingsStore.set('cart:1851080500', '664467442');
     mappingsStore.set('ref:273025367', '664467442');
 
-    trackingStore.set('664467442', { id: 'gclid_order_id', type: 'gclid' });
-    let matched = await exported.reconcile('664467442', '1851080500');
-    assert.equal(matched, true);
+    const oldFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 204 });
+    try {
+        trackingStore.set('664467442', { id: 'gclid_order_id', type: 'gclid' });
+        let matched = await exported.reconcile('664467442', '1851080500');
+        assert.equal(matched, true);
 
-    trackingStore.clear();
-    trackingStore.set('1851080500', { id: 'gclid_cart_id', type: 'gclid' });
-    matched = await exported.reconcile('664467442', '1851080500');
-    assert.equal(matched, true);
+        trackingStore.clear();
+        trackingStore.set('1851080500', { id: 'gclid_cart_id', type: 'gclid' });
+        matched = await exported.reconcile('664467442', '1851080500');
+        assert.equal(matched, true);
 
-    trackingStore.clear();
-    trackingStore.set('273025367', { id: 'gclid_ref_id', type: 'gclid' });
-    matched = await exported.reconcile('664467442', '1851080500');
-    assert.equal(matched, true);
+        trackingStore.clear();
+        trackingStore.set('273025367', { id: 'gclid_ref_id', type: 'gclid' });
+        matched = await exported.reconcile('664467442', '1851080500');
+        assert.equal(matched, true);
+    } finally {
+        global.fetch = oldFetch;
+    }
 });
 
 (async () => {
