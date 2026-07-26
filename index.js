@@ -51,8 +51,12 @@ function authorized(req, secret) {
     const header = req.headers.authorization;
     if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
     const supplied = Buffer.from(header.slice(7));
-    const expected = Buffer.from(secret);
-    return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+    const secrets = Array.isArray(secret) ? secret : [secret];
+    return secrets.some(sec => {
+        if (!sec) return false;
+        const expected = Buffer.from(sec);
+        return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+    });
 }
 function buildReconciliationStates(sentKeys, clickKeys, orderKeys, rejectedKeys = []) {
     const idsFromKeys = (keys, prefix) => new Set(keys.flatMap(value => {
@@ -228,7 +232,7 @@ app.post('/webhook', async (req, res) => {
 app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 app.get('/readyz', async (req, res) => { try { await (await getRedis()).ping(); res.json({ status: 'ready' }); } catch { res.status(503).json({ status: 'not-ready' }); } });
 app.get('/internal/reconciliation', async (req, res) => {
-    if (!authorized(req, OBSERVATORY_SECRET)) return res.status(401).send('Unauthorized');
+    if (!authorized(req, [OBSERVATORY_SECRET, ADMIN_SECRET, CRON_SECRET])) return res.status(401).send('Unauthorized');
     try {
         const [sentKeys, clickKeys, orderKeys, rejectedKeys] = await Promise.all([
             store.scanKeys('sent:*'),
