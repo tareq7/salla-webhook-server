@@ -360,6 +360,18 @@ test('Data Manager refuses raw customer identifiers without explicit consent con
     }), error => error.code === 'DATA_MANAGER_CONSENT_REQUIRED');
 });
 
+test('Data Manager does not treat shipping-recipient contacts as customer identifiers', () => {
+    const { buildPayload } = require('../googleDataManager');
+    const payload = buildPayload('123', { id: 'gclid', type: 'gclid' }, {
+        amounts: { total: { amount: 1 } }, customer: {},
+        shipping: { receiver: { email: 'recipient@example.test', phone: '+966500000000' } }
+    }, {
+        enabled: true, customerId: '5365425266', conversionActionId: '6883871446'
+    });
+    assert.equal(payload.events[0].userData, undefined);
+    assert.doesNotMatch(JSON.stringify(payload), /recipient@example\.test|966500000000/);
+});
+
 test('Data Manager retries a transient response and returns the diagnostic request ID', async () => {
     const { deliver, resetTokenCache } = require('../googleDataManager');
     resetTokenCache();

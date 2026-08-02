@@ -106,9 +106,7 @@ function nameParts(order) {
     let givenName = normalizeName(customer.first_name);
     let familyName = normalizeName(customer.last_name);
     if (givenName && familyName) return { givenName, familyName };
-    const fullName = normalizeName(firstValue([
-        customer.full_name, order?.shipping?.receiver?.name, order?.shipments?.[0]?.ship_to?.name
-    ]));
+    const fullName = normalizeName(customer.full_name);
     const parts = fullName?.split(' ').filter(Boolean) || [];
     if (!givenName) givenName = parts[0] || null;
     if (!familyName) familyName = parts.length > 1 ? parts.at(-1) : null;
@@ -136,15 +134,13 @@ function addressIdentifier(order) {
 
 function buildUserData(order) {
     const customer = order?.customer || {};
-    const receiver = order?.shipping?.receiver || {};
     const shipTo = (Array.isArray(order?.shipments) ? order.shipments : []).map(item => item?.ship_to || {});
-    const emails = [customer.email, receiver.email, ...shipTo.map(item => item.email)]
-        .map(normalizeEmail).filter(Boolean);
+    const emails = [customer.email].map(normalizeEmail).filter(Boolean);
     const regionCode = String(firstValue([
         customer.country_code, order?.shipping?.address?.country_code, shipTo[0]?.country_code
     ]) || '').trim().toUpperCase();
     const dialCode = customer.mobile_code || (regionCode === 'SA' ? '966' : null);
-    const phones = [order?.e164Phone, customer.mobile, receiver.phone, ...shipTo.map(item => item.phone)]
+    const phones = [order?.e164Phone, customer.mobile]
         .map(value => normalizePhoneNumber(value, dialCode)).filter(Boolean);
     const identifiers = [];
     for (const email of [...new Set(emails)].slice(0, 4)) identifiers.push({ emailAddress: sha256Hex(email) });
