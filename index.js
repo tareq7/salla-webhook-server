@@ -498,6 +498,10 @@ function prepareRecoveryOrder(orderId, order) {
         code: 'RECOVERY_ORDER_VALUE_INVALID', status: 409
     });
     const prepared = { ...order, e164Phone: normalizePhone(order.customer?.mobile) };
+    const amount = valuePart => {
+        const parsed = Number.parseFloat(valuePart?.amount ?? valuePart);
+        return Number.isFinite(parsed) ? parsed : null;
+    };
     return {
         orderId,
         transactionId: String(order.reference_id || orderId),
@@ -505,6 +509,16 @@ function prepareRecoveryOrder(orderId, order) {
         currency: String(order.currency || order.amounts?.total?.currency || 'SAR').toUpperCase(),
         orderStatus: statusSlug || null,
         isPendingPayment: order?.is_pending_payment ?? null,
+        updatedAt: order?.updated_at?.date || order?.updated_at || null,
+        amountSummary: {
+            subTotal: amount(order?.amounts?.sub_total),
+            shipping: amount(order?.amounts?.shipping_cost),
+            cashOnDelivery: amount(order?.amounts?.cash_on_delivery),
+            tax: amount(order?.amounts?.tax?.amount),
+            discountTotal: (Array.isArray(order?.amounts?.discounts) ? order.amounts.discounts : [])
+                .reduce((total, discount) => total + (amount(discount?.discount ?? discount?.amount) || 0), 0),
+            total: value
+        },
         order: prepared
     };
 }
@@ -540,6 +554,7 @@ app.post('/admin/recover-google-ads', async (req, res) => {
                     orderId: item.orderId, transactionId: item.transactionId,
                     value: item.value, currency: item.currency,
                     orderStatus: item.orderStatus, isPendingPayment: item.isPendingPayment,
+                    updatedAt: item.updatedAt, amountSummary: item.amountSummary,
                     customerIdentifierTypes: validation.customerIdentifierTypes,
                     validated: true, requestId: validation.requestId
                 });
