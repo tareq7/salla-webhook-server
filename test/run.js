@@ -56,6 +56,7 @@ function loadIndex(storeOverrides = {}, dataManagerOverrides = {}) {
     const dataManagerMock = {
         enabled: () => false,
         trackingFingerprint: value => value ? 'test-fingerprint' : null,
+        customerIdentifierTypes: () => [],
         deliver: async () => ({ enabled: false }),
         retrieveStatus: async () => ({ enabled: false }),
         ...dataManagerOverrides
@@ -262,18 +263,23 @@ test('sGTM delivery retries network failures without leaking the request URL', a
     assert.equal(calls, 2);
 });
 
-test('Data Manager payload uses the website conversion action and contains no customer PII', () => {
+test('Data Manager payload includes consented normalized and hashed customer identifiers', () => {
     const { buildPayload } = require('../googleDataManager');
     const payload = buildPayload('1394366923', { id: 'valid-gclid', type: 'gclid' }, {
         reference_id: 274120304,
         amounts: { total: { amount: 297.37 } },
         currency: 'sar',
         __eventTimestamp: 'Sun Jul 26 2026 09:41:52 GMT+0300',
-        customer: { email: 'must-not-leak@example.test', mobile: '+966500000000' }
+        customer: {
+            email: ' Test.Email+ignored@Gmail.com ', mobile: '0500000000', mobile_code: '966',
+            first_name: ' Test ', last_name: 'Customer', country_code: 'sa'
+        },
+        shipping: { address: { postal_code: '12345' } }
     }, {
         enabled: true,
         customerId: '5365425266',
-        conversionActionId: '6883871446'
+        conversionActionId: '6883871446',
+        customerDataConsentGranted: true
     });
     assert.deepEqual(payload.destinations, [{
         operatingAccount: { accountType: 'GOOGLE_ADS', accountId: '5365425266' },
@@ -281,14 +287,77 @@ test('Data Manager payload uses the website conversion action and contains no cu
         productDestinationId: '6883871446'
     }]);
     assert.deepEqual(payload.events, [{
-        adIdentifiers: { gclid: 'valid-gclid' },
         conversionValue: 297.37,
         currency: 'SAR',
         eventTimestamp: '2026-07-26T06:41:52.000Z',
         transactionId: '274120304',
-        eventSource: 'WEB'
+        eventSource: 'WEB',
+        adIdentifiers: { gclid: 'valid-gclid' },
+        userData: { userIdentifiers: [
+            { emailAddress: 'a098c724c420a06afc331866e4d878f047f1ca2e9528523ad781b3ba1c63c03d' },
+            { phoneNumber: '220572970df36306b5e1e5321e2a3e8e533f99c9b3e7cfaca7bf9c33c3ae6e98' },
+            { address: {
+                givenName: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+                familyName: 'b6c45863875e34487ca3c155ed145efe12a74581e27befec5aa661b8ee8ca6dd',
+                regionCode: 'SA', postalCode: '12345'
+            } }
+        ] }
     }]);
-    assert.doesNotMatch(JSON.stringify(payload), /must-not-leak|966500000000/);
+    assert.deepEqual(payload.consent, { adUserData: 'CONSENT_GRANTED' });
+    assert.equal(payload.encoding, 'HEX');
+    assert.doesNotMatch(JSON.stringify(payload), /Test.Email|gmail\.com|0500000000|966500000000|Customer/);
+});
+
+test('Data Manager supports enhanced-conversion delivery without a click identifier', () => {
+    const { buildPayload } = require('../googleDataManager');
+    const payload = buildPayload('1604203926', null, {
+        reference_id: 275476275,
+        amounts: { total: { amount: 99 } },
+        currency: 'SAR',
+        customer: { email: 'buyer@example.test' }
+    }, {
+        enabled: true, customerId: '5365425266', conversionActionId: '6883871446',
+        customerDataConsentGranted: true
+    });
+    assert.equal(payload.events[0].adIdentifiers, undefined);
+    assert.match(payload.events[0].userData.userIdentifiers[0].emailAddress, /^[a-f0-9]{64}$/);
+    assert.doesNotMatch(JSON.stringify(payload), /buyer@example\.test/);
+});
+
+test('PII-only conversion is submitted and stores a non-sensitive receipt', async () => {
+    const receipts = [];
+    const { exported } = loadIndex({
+        saveDataManagerReceipt: async (id, receipt) => receipts.push({ id, receipt })
+    }, {
+        enabled: () => true,
+        customerIdentifierTypes: () => ['emailAddress'],
+        deliver: async () => ({
+            requestId: 'pii-only-request', trackingType: null, trackingFingerprint: null,
+            customerIdentifierTypes: ['emailAddress'], attempts: 1, status: 200, durationMs: 5
+        })
+    });
+    const result = await exported.sendToDataManager('1604203926', null, {
+        reference_id: 275476275, customer: { email: 'buyer@example.test' }
+    });
+    assert.equal(result.requestId, 'pii-only-request');
+    assert.deepEqual(receipts, [{
+        id: '275476275',
+        receipt: {
+            requestId: 'pii-only-request', status: 'submitted', trackingType: null,
+            trackingFingerprint: null, customerIdentifierTypes: ['emailAddress'],
+            submittedAt: receipts[0].receipt.submittedAt
+        }
+    }]);
+    assert.doesNotMatch(JSON.stringify(receipts), /buyer@example\.test|[a-f0-9]{64}/);
+});
+
+test('Data Manager refuses raw customer identifiers without explicit consent configuration', () => {
+    const { buildPayload } = require('../googleDataManager');
+    assert.throws(() => buildPayload('123', { id: 'gclid', type: 'gclid' }, {
+        amounts: { total: { amount: 1 } }, customer: { email: 'buyer@example.test' }
+    }, {
+        enabled: true, customerId: '5365425266', conversionActionId: '6883871446'
+    }), error => error.code === 'DATA_MANAGER_CONSENT_REQUIRED');
 });
 
 test('Data Manager retries a transient response and returns the diagnostic request ID', async () => {
@@ -303,6 +372,7 @@ test('Data Manager retries a transient response and returns the diagnostic reque
     }, {
         config: {
             enabled: true, customerId: '5365425266', conversionActionId: '6883871446',
+            customerDataConsentGranted: true,
             timeoutMs: 1000, maxAttempts: 2, baseDelayMs: 100, maxDelayMs: 1000
         },
         accessToken: 'test-access-token',
@@ -403,7 +473,10 @@ test('conversion is marked sent only after Data Manager accepts it', async () =>
         deleteOrderDetails: async () => {}
     }, {
         enabled: () => true,
-        deliver: async () => ({ requestId: 'dm-request-1', trackingFingerprint: 'fingerprint', attempts: 1, status: 200, durationMs: 10 })
+        deliver: async () => ({
+            requestId: 'dm-request-1', trackingType: 'gclid', trackingFingerprint: 'fingerprint',
+            customerIdentifierTypes: [], attempts: 1, status: 200, durationMs: 10
+        })
     });
     const oldFetch = global.fetch;
     global.fetch = async () => ({ ok: true, status: 204 });

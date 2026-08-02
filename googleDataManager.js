@@ -32,6 +32,11 @@ function config(env = process.env) {
             code: 'DATA_MANAGER_CONFIG_ERROR', retryable: false
         });
     }
+    if (String(env.GOOGLE_ADS_CUSTOMER_DATA_CONSENT_GRANTED || '').toLowerCase() !== 'true') {
+        throw new DataManagerError('Explicit customer data consent must be configured before Data Manager delivery', {
+            code: 'DATA_MANAGER_CONSENT_CONFIG_ERROR', retryable: false
+        });
+    }
     return {
         enabled: true,
         clientId: env.GOOGLE_OAUTH_CLIENT_ID,
@@ -39,6 +44,7 @@ function config(env = process.env) {
         refreshToken: env.GOOGLE_OAUTH_REFRESH_TOKEN,
         customerId: env.GOOGLE_ADS_CUSTOMER_ID,
         conversionActionId: env.GOOGLE_ADS_CONVERSION_ACTION_ID,
+        customerDataConsentGranted: true,
         timeoutMs: integerEnv('GOOGLE_DATA_MANAGER_TIMEOUT_MS', 8000, 1000, 20000, env),
         maxAttempts: integerEnv('GOOGLE_DATA_MANAGER_MAX_ATTEMPTS', 3, 1, 5, env),
         baseDelayMs: integerEnv('GOOGLE_DATA_MANAGER_RETRY_BASE_MS', 400, 50, 3000, env),
@@ -48,6 +54,109 @@ function config(env = process.env) {
 
 function trackingFingerprint(trackingId) {
     return trackingId ? crypto.createHash('sha256').update(String(trackingId)).digest('hex').slice(0, 16) : null;
+}
+
+function sha256Hex(value) {
+    return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+
+function normalizeEmail(value) {
+    if (value === null || value === undefined) return null;
+    const email = String(value).toLowerCase().replace(/\s+/g, '');
+    const separator = email.lastIndexOf('@');
+    if (separator < 1 || separator === email.length - 1 || email.indexOf('@') !== separator) return null;
+    let local = email.slice(0, separator);
+    const domain = email.slice(separator + 1);
+    if (!domain.includes('.') || /[^a-z0-9.!#$%&'*+/=?^_`{|}~@-]/i.test(email)) return null;
+    if (domain === 'gmail.com' || domain === 'googlemail.com') {
+        local = local.split('+', 1)[0].replace(/\./g, '');
+    }
+    return local ? `${local}@${domain}` : null;
+}
+
+function normalizePhoneNumber(value, dialCode) {
+    if (value === null || value === undefined || value === '') return null;
+    const raw = String(value).trim();
+    let digits = raw.replace(/\D/g, '');
+    if (digits.startsWith('00')) digits = digits.slice(2);
+    const countryDialCode = String(dialCode || '').replace(/\D/g, '');
+    if (countryDialCode && !digits.startsWith(countryDialCode)) {
+        if (digits.startsWith('0')) digits = `${countryDialCode}${digits.slice(1)}`;
+        else if (!raw.startsWith('+')) digits = `${countryDialCode}${digits}`;
+    } else if (!countryDialCode) {
+        if (digits.startsWith('05') && digits.length === 10) digits = `966${digits.slice(1)}`;
+        else if (digits.startsWith('5') && digits.length === 9) digits = `966${digits}`;
+    }
+    return /^\d{8,15}$/.test(digits) ? `+${digits}` : null;
+}
+
+function normalizeName(value) {
+    if (value === null || value === undefined) return null;
+    const normalized = String(value).normalize('NFKC').toLowerCase()
+        .replace(/[\p{P}\p{S}]/gu, '').replace(/\s+/g, ' ').trim();
+    return normalized || null;
+}
+
+function firstValue(values) {
+    return values.find(value => value !== null && value !== undefined && String(value).trim()) ?? null;
+}
+
+function nameParts(order) {
+    const customer = order?.customer || {};
+    let givenName = normalizeName(customer.first_name);
+    let familyName = normalizeName(customer.last_name);
+    if (givenName && familyName) return { givenName, familyName };
+    const fullName = normalizeName(firstValue([
+        customer.full_name, order?.shipping?.receiver?.name, order?.shipments?.[0]?.ship_to?.name
+    ]));
+    const parts = fullName?.split(' ').filter(Boolean) || [];
+    if (!givenName) givenName = parts[0] || null;
+    if (!familyName) familyName = parts.length > 1 ? parts.at(-1) : null;
+    return { givenName, familyName };
+}
+
+function addressIdentifier(order) {
+    const shippingAddress = order?.shipping?.address || {};
+    const shipTo = order?.shipments?.[0]?.ship_to || {};
+    const { givenName, familyName } = nameParts(order);
+    const regionCode = String(firstValue([
+        order?.customer?.country_code, shippingAddress.country_code, shipTo.country_code
+    ]) || '').trim().toUpperCase();
+    const postalCode = String(firstValue([shippingAddress.postal_code, shipTo.postal_code]) || '').trim();
+    if (!givenName || !familyName || !/^[A-Z]{2}$/.test(regionCode) || !postalCode) return null;
+    return {
+        address: {
+            givenName: sha256Hex(givenName),
+            familyName: sha256Hex(familyName),
+            regionCode,
+            postalCode
+        }
+    };
+}
+
+function buildUserData(order) {
+    const customer = order?.customer || {};
+    const receiver = order?.shipping?.receiver || {};
+    const shipTo = (Array.isArray(order?.shipments) ? order.shipments : []).map(item => item?.ship_to || {});
+    const emails = [customer.email, receiver.email, ...shipTo.map(item => item.email)]
+        .map(normalizeEmail).filter(Boolean);
+    const regionCode = String(firstValue([
+        customer.country_code, order?.shipping?.address?.country_code, shipTo[0]?.country_code
+    ]) || '').trim().toUpperCase();
+    const dialCode = customer.mobile_code || (regionCode === 'SA' ? '966' : null);
+    const phones = [order?.e164Phone, customer.mobile, receiver.phone, ...shipTo.map(item => item.phone)]
+        .map(value => normalizePhoneNumber(value, dialCode)).filter(Boolean);
+    const identifiers = [];
+    for (const email of [...new Set(emails)].slice(0, 4)) identifiers.push({ emailAddress: sha256Hex(email) });
+    for (const phone of [...new Set(phones)].slice(0, 4)) identifiers.push({ phoneNumber: sha256Hex(phone) });
+    const address = addressIdentifier(order);
+    if (address) identifiers.push(address);
+    return identifiers.length ? { userIdentifiers: identifiers.slice(0, 10) } : null;
+}
+
+function customerIdentifierTypes(order) {
+    const identifiers = buildUserData(order)?.userIdentifiers || [];
+    return [...new Set(identifiers.map(identifier => Object.keys(identifier)[0]))];
 }
 
 function eventTimestamp(order, now = new Date()) {
@@ -66,8 +175,15 @@ function eventTimestamp(order, now = new Date()) {
 
 function buildPayload(orderId, tracking, order, deliveryConfig = config(), now = new Date()) {
     if (!deliveryConfig.enabled) return null;
-    if (!tracking?.id || !['gclid', 'gbraid', 'wbraid'].includes(tracking.type)) {
-        throw new DataManagerError('A supported Google Ads click identifier is required', {
+    const supportedTracking = Boolean(tracking?.id && ['gclid', 'gbraid', 'wbraid'].includes(tracking.type));
+    const userData = buildUserData(order);
+    if (userData && deliveryConfig.customerDataConsentGranted !== true) {
+        throw new DataManagerError('Explicit customer data consent is required for user identifiers', {
+            code: 'DATA_MANAGER_CONSENT_REQUIRED', retryable: false
+        });
+    }
+    if (!supportedTracking && !userData) {
+        throw new DataManagerError('A supported Google Ads click identifier or customer identifier is required', {
             code: 'DATA_MANAGER_IDENTIFIER_REQUIRED', retryable: false
         });
     }
@@ -78,20 +194,24 @@ function buildPayload(orderId, tracking, order, deliveryConfig = config(), now =
             code: 'DATA_MANAGER_VALUE_INVALID', retryable: false
         });
     }
+    const event = {
+        conversionValue: value,
+        currency: String(order?.currency || 'SAR').toUpperCase(),
+        eventTimestamp: eventTimestamp(order, now),
+        transactionId,
+        eventSource: 'WEB'
+    };
+    if (supportedTracking) event.adIdentifiers = { [tracking.type]: tracking.id };
+    if (userData) event.userData = userData;
     return {
         destinations: [{
             operatingAccount: { accountType: 'GOOGLE_ADS', accountId: deliveryConfig.customerId },
             loginAccount: { accountType: 'GOOGLE_ADS', accountId: deliveryConfig.customerId },
             productDestinationId: deliveryConfig.conversionActionId
         }],
-        events: [{
-            adIdentifiers: { [tracking.type]: tracking.id },
-            conversionValue: value,
-            currency: String(order?.currency || 'SAR').toUpperCase(),
-            eventTimestamp: eventTimestamp(order, now),
-            transactionId,
-            eventSource: 'WEB'
-        }],
+        events: [event],
+        consent: { adUserData: 'CONSENT_GRANTED' },
+        encoding: 'HEX',
         validateOnly: false
     };
 }
@@ -190,6 +310,8 @@ async function deliver(orderId, tracking, order, options = {}) {
     const deliveryConfig = options.config || config();
     if (!deliveryConfig.enabled) return { enabled: false };
     const payload = buildPayload(orderId, tracking, order, deliveryConfig, options.now || new Date());
+    const identifierTypes = customerIdentifierTypes(order);
+    const supportedTracking = Boolean(tracking?.id && ['gclid', 'gbraid', 'wbraid'].includes(tracking.type));
     const fetchFn = options.fetchFn || global.fetch;
     const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
     const random = options.random || Math.random;
@@ -220,7 +342,9 @@ async function deliver(orderId, tracking, order, options = {}) {
             return {
                 enabled: true, requestId: String(body.requestId), attempts: attempt,
                 status: response.status, durationMs: Date.now() - startedAt,
-                trackingFingerprint: trackingFingerprint(tracking.id)
+                trackingType: supportedTracking ? tracking.type : null,
+                trackingFingerprint: supportedTracking ? trackingFingerprint(tracking.id) : null,
+                customerIdentifierTypes: identifierTypes
             };
         }
         const retryable = RETRYABLE_STATUSES.has(response.status) || response.status >= 500;
@@ -272,5 +396,6 @@ function resetTokenCache() { cachedToken = null; }
 
 module.exports = {
     TOKEN_URL, INGEST_URL, STATUS_URL, DataManagerError, enabled, config, eventTimestamp,
+    normalizeEmail, normalizePhoneNumber, normalizeName, buildUserData, customerIdentifierTypes,
     buildPayload, trackingFingerprint, summarizeStatus, accessToken, deliver, retrieveStatus, resetTokenCache
 };

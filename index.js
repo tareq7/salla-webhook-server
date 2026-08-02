@@ -134,8 +134,10 @@ async function sendToSgtm(orderId, tracking, order) {
 
 async function sendToDataManager(orderId, tracking, order) {
     if (!dataManager.enabled()) return { enabled: false };
-    if (!tracking?.id || !['gclid', 'wbraid', 'gbraid'].includes(tracking.type)) {
-        return { enabled: false, reason: 'no_supported_click_identifier' };
+    const supportedClick = Boolean(tracking?.id && ['gclid', 'wbraid', 'gbraid'].includes(tracking.type));
+    const customerIdentifierTypes = dataManager.customerIdentifierTypes(order);
+    if (!supportedClick && customerIdentifierTypes.length === 0) {
+        return { enabled: false, reason: 'no_supported_identifier' };
     }
     const transactionId = String(order.reference_id || orderId);
     try {
@@ -143,14 +145,16 @@ async function sendToDataManager(orderId, tracking, order) {
         await store.saveDataManagerReceipt(transactionId, {
             requestId: result.requestId,
             status: 'submitted',
-            trackingType: tracking?.type || null,
+            trackingType: result.trackingType,
             trackingFingerprint: result.trackingFingerprint,
+            customerIdentifierTypes: result.customerIdentifierTypes,
             submittedAt: new Date().toISOString()
         });
         console.log('Purchase submitted to Google Data Manager', {
             orderId, transactionId, requestId: result.requestId,
-            trackingType: tracking?.type || null,
+            trackingType: result.trackingType,
             trackingFingerprint: result.trackingFingerprint,
+            customerIdentifierTypes: result.customerIdentifierTypes,
             attempts: result.attempts, status: result.status, durationMs: result.durationMs
         });
         return result;
