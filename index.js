@@ -489,7 +489,7 @@ async function fetchSallaOrder(orderId, merchantId) {
 function prepareRecoveryOrder(orderId, order) {
     const statusSlug = String(order?.status?.slug || '').toLowerCase();
     const value = Number.parseFloat(order?.amounts?.total?.amount);
-    if (order?.is_pending_payment !== false || ['payment_pending', 'canceled', 'cancelled'].includes(statusSlug)) {
+    if (order?.is_pending_payment === true || ['payment_pending', 'canceled', 'cancelled'].includes(statusSlug)) {
         throw Object.assign(new Error('Order is not eligible for conversion recovery'), {
             code: 'RECOVERY_ORDER_NOT_PAID', status: 409
         });
@@ -503,6 +503,8 @@ function prepareRecoveryOrder(orderId, order) {
         transactionId: String(order.reference_id || orderId),
         value,
         currency: String(order.currency || order.amounts?.total?.currency || 'SAR').toUpperCase(),
+        orderStatus: statusSlug || null,
+        isPendingPayment: order?.is_pending_payment ?? null,
         order: prepared
     };
 }
@@ -537,6 +539,7 @@ app.post('/admin/recover-google-ads', async (req, res) => {
                 results.push({
                     orderId: item.orderId, transactionId: item.transactionId,
                     value: item.value, currency: item.currency,
+                    orderStatus: item.orderStatus, isPendingPayment: item.isPendingPayment,
                     customerIdentifierTypes: validation.customerIdentifierTypes,
                     validated: true, requestId: validation.requestId
                 });
@@ -566,6 +569,7 @@ app.post('/admin/recover-google-ads', async (req, res) => {
                 const result = {
                     orderId: item.orderId, transactionId: item.transactionId,
                     value: item.value, currency: item.currency,
+                    orderStatus: item.orderStatus, isPendingPayment: item.isPendingPayment,
                     customerIdentifierTypes: delivery.customerIdentifierTypes,
                     requestId: delivery.requestId, submittedAt, alreadySubmitted: false
                 };
