@@ -351,6 +351,23 @@ test('Data Manager status response preserves Google processing errors without ev
     assert.doesNotMatch(JSON.stringify(result), /request-abc|test-access-token/);
 });
 
+test('Data Manager treats a not-yet-visible request status as retryable', async () => {
+    const { retrieveStatus } = require('../googleDataManager');
+    await assert.rejects(() => retrieveStatus('request-propagating', {
+        config: { enabled: true, timeoutMs: 1000 },
+        accessToken: 'test-access-token',
+        fetchFn: async () => ({
+            ok: false, status: 404,
+            json: async () => ({ error: { status: 'NOT_FOUND' } })
+        })
+    }), error => {
+        assert.equal(error.code, 'DATA_MANAGER_STATUS_HTTP_ERROR');
+        assert.equal(error.status, 404);
+        assert.equal(error.retryable, true);
+        return true;
+    });
+});
+
 test('protected Data Manager status endpoint stores the terminal diagnostic', async () => {
     const saved = [];
     const { routes } = loadIndex({

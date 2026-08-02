@@ -262,7 +262,7 @@ async function retrieveStatus(requestId, options = {}) {
     if (!response.ok) {
         throw new DataManagerError('Data Manager status request was rejected', {
             code: 'DATA_MANAGER_STATUS_HTTP_ERROR', status: response.status,
-            reason: errorReason(body), retryable: RETRYABLE_STATUSES.has(response.status) || response.status >= 500
+            reason: errorReason(body), retryable: response.status === 404 || RETRYABLE_STATUSES.has(response.status) || response.status >= 500
         });
     }
     return { enabled: true, ...summarizeStatus(body) };
