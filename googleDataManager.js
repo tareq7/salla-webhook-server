@@ -306,8 +306,6 @@ async function deliver(orderId, tracking, order, options = {}) {
     const deliveryConfig = options.config || config();
     if (!deliveryConfig.enabled) return { enabled: false };
     const payload = buildPayload(orderId, tracking, order, deliveryConfig, options.now || new Date());
-    const validateOnly = options.validateOnly === true;
-    payload.validateOnly = validateOnly;
     const identifierTypes = customerIdentifierTypes(order);
     const supportedTracking = Boolean(tracking?.id && ['gclid', 'gbraid', 'wbraid'].includes(tracking.type));
     const fetchFn = options.fetchFn || global.fetch;
@@ -336,10 +334,9 @@ async function deliver(orderId, tracking, order, options = {}) {
             continue;
         }
         const body = await responseJson(response);
-        if (response.ok && (body.requestId || validateOnly)) {
+        if (response.ok && body.requestId) {
             return {
-                enabled: true, requestId: body.requestId ? String(body.requestId) : null,
-                validateOnly, attempts: attempt,
+                enabled: true, requestId: String(body.requestId), attempts: attempt,
                 status: response.status, durationMs: Date.now() - startedAt,
                 trackingType: supportedTracking ? tracking.type : null,
                 trackingFingerprint: supportedTracking ? trackingFingerprint(tracking.id) : null,
