@@ -455,6 +455,142 @@ app.post('/admin/force-push', async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+function approvedRecoveryConfig() {
+    const batchId = String(process.env.RECOVERY_BATCH_ID || '');
+    const merchantId = String(process.env.RECOVERY_MERCHANT_ID || '');
+    const orderIds = new Set(String(process.env.RECOVERY_ORDER_IDS || '').split(',').map(value => value.trim()).filter(Boolean));
+    if (!validIdentifier(batchId, 128) || !/^\d+$/.test(merchantId) || orderIds.size === 0) {
+        throw Object.assign(new Error('Recovery is not configured'), { code: 'RECOVERY_CONFIG_INVALID', status: 503 });
+    }
+    return { batchId, merchantId, orderIds };
+}
+
+async function fetchSallaOrder(orderId, merchantId) {
+    const accessToken = await getSallaAccessToken(merchantId);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    let response;
+    try {
+        response = await fetch(`https://api.salla.dev/admin/v2/orders/${encodeURIComponent(orderId)}`, {
+            headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+            signal: controller.signal
+        });
+    } finally { clearTimeout(timeout); }
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw Object.assign(new Error('Salla order lookup failed'), {
+        code: 'SALLA_ORDER_LOOKUP_FAILED', status: response.status
+    });
+    if (String(body?.data?.id || '') !== orderId) throw Object.assign(new Error('Salla returned a different order'), {
+        code: 'SALLA_ORDER_ID_MISMATCH', status: 502
+    });
+    return body.data;
+}
+
+function prepareRecoveryOrder(orderId, order) {
+    const statusSlug = String(order?.status?.slug || '').toLowerCase();
+    const value = Number.parseFloat(order?.amounts?.total?.amount);
+    if (order?.is_pending_payment !== false || ['payment_pending', 'canceled', 'cancelled'].includes(statusSlug)) {
+        throw Object.assign(new Error('Order is not eligible for conversion recovery'), {
+            code: 'RECOVERY_ORDER_NOT_PAID', status: 409
+        });
+    }
+    if (!Number.isFinite(value) || value < 0) throw Object.assign(new Error('Order conversion value is invalid'), {
+        code: 'RECOVERY_ORDER_VALUE_INVALID', status: 409
+    });
+    const prepared = { ...order, e164Phone: normalizePhone(order.customer?.mobile) };
+    return {
+        orderId,
+        transactionId: String(order.reference_id || orderId),
+        value,
+        currency: String(order.currency || order.amounts?.total?.currency || 'SAR').toUpperCase(),
+        order: prepared
+    };
+}
+
+app.use('/admin/recover-google-ads', express.json({ limit: '4kb' }));
+app.post('/admin/recover-google-ads', async (req, res) => {
+    if (!authorized(req, process.env.RECOVERY_SECRET || '')) return res.status(401).send('Unauthorized');
+    try {
+        const recovery = approvedRecoveryConfig();
+        const requested = Array.isArray(req.body?.order_ids) ? [...new Set(req.body.order_ids)] : [];
+        if (requested.length === 0 || requested.length > 2 || requested.some(id => !recovery.orderIds.has(id))) {
+            return res.status(400).json({ error: 'Order IDs are not approved for this recovery' });
+        }
+        const prepared = [];
+        for (const orderId of requested) {
+            if (!/^\d+$/.test(orderId)) return res.status(400).json({ error: 'Invalid order ID' });
+            prepared.push(prepareRecoveryOrder(orderId, await fetchSallaOrder(orderId, recovery.merchantId)));
+        }
+        const validateOnly = req.body?.validate_only === true;
+        const redis = await getRedis();
+        const results = [];
+        for (const item of prepared) {
+            const markerKey = `approved_recovery:${recovery.batchId}:${item.orderId}`;
+            const previousMarker = await redis.get(markerKey);
+            if (!validateOnly && previousMarker) {
+                const parsed = JSON.parse(previousMarker);
+                results.push({ ...parsed, alreadySubmitted: true });
+                continue;
+            }
+            if (validateOnly) {
+                const validation = await dataManager.deliver(item.orderId, null, item.order, { validateOnly: true });
+                results.push({
+                    orderId: item.orderId, transactionId: item.transactionId,
+                    value: item.value, currency: item.currency,
+                    customerIdentifierTypes: validation.customerIdentifierTypes,
+                    validated: true, requestId: validation.requestId
+                });
+                continue;
+            }
+            const lockKey = `approved_recovery_lock:${recovery.batchId}:${item.orderId}`;
+            const owner = crypto.randomUUID();
+            if (!await redis.set(lockKey, owner, { NX: true, EX: 120 })) {
+                return res.status(409).json({ error: 'Recovery is already processing', orderId: item.orderId });
+            }
+            try {
+                const recheck = await redis.get(markerKey);
+                if (recheck) {
+                    results.push({ ...JSON.parse(recheck), alreadySubmitted: true });
+                    continue;
+                }
+                const previousReceipt = await store.getDataManagerReceipt(item.transactionId);
+                const delivery = await dataManager.deliver(item.orderId, null, item.order);
+                const submittedAt = new Date().toISOString();
+                const receipt = {
+                    requestId: delivery.requestId, status: 'submitted', trackingType: null,
+                    trackingFingerprint: null, customerIdentifierTypes: delivery.customerIdentifierTypes,
+                    submittedAt, recoveryBatchId: recovery.batchId,
+                    previousRequestId: previousReceipt?.requestId || null
+                };
+                await store.saveDataManagerReceipt(item.transactionId, receipt);
+                const result = {
+                    orderId: item.orderId, transactionId: item.transactionId,
+                    value: item.value, currency: item.currency,
+                    customerIdentifierTypes: delivery.customerIdentifierTypes,
+                    requestId: delivery.requestId, submittedAt, alreadySubmitted: false
+                };
+                await redis.set(markerKey, JSON.stringify(result), { EX: 60 * 60 * 24 * 90 });
+                results.push(result);
+                console.log('Approved Google Ads recovery submitted', {
+                    orderId: item.orderId, transactionId: item.transactionId,
+                    requestId: delivery.requestId, customerIdentifierTypes: delivery.customerIdentifierTypes
+                });
+            } finally {
+                await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", {
+                    keys: [lockKey], arguments: [owner]
+                });
+            }
+        }
+        return res.json({ status: validateOnly ? 'validated' : 'submitted', batchId: recovery.batchId, results });
+    } catch (error) {
+        console.error('Approved Google Ads recovery failed', {
+            code: error.code || 'RECOVERY_UNKNOWN_ERROR', status: error.status
+        });
+        return res.status(error.status && error.status >= 400 && error.status < 600 ? error.status : 500)
+            .json({ error: 'Recovery failed', code: error.code || 'RECOVERY_UNKNOWN_ERROR' });
+    }
+});
+
 async function getSallaAccessToken(merchantId) {
 
 

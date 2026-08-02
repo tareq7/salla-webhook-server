@@ -18,7 +18,7 @@ function makeStorage(initial = {}) {
     };
 }
 
-function loadIndex(storeOverrides = {}, dataManagerOverrides = {}) {
+function loadIndex(storeOverrides = {}, dataManagerOverrides = {}, redisOverrides = {}) {
     process.env.SALLA_WEBHOOK_SECRET = 'test-webhook-secret';
     process.env.ADMIN_SECRET = 'test-admin-secret';
     process.env.CRON_SECRET = 'test-cron-secret';
@@ -49,10 +49,12 @@ function loadIndex(storeOverrides = {}, dataManagerOverrides = {}) {
         getDataManagerReceipt: async () => null,
         getTrackingForOrder: async () => null,
         getOrderDetails: async () => null,
+        getMerchantToken: async () => null,
         scanKeys: async () => [],
         ...storeOverrides
     };
-    const redisMock = { getRedis: async () => ({}), closeRedis: async () => {} };
+    const redisClient = { ...redisOverrides };
+    const redisMock = { getRedis: async () => redisClient, closeRedis: async () => {} };
     const dataManagerMock = {
         enabled: () => false,
         trackingFingerprint: value => value ? 'test-fingerprint' : null,
@@ -404,6 +406,30 @@ test('Data Manager retries a transient response and returns the diagnostic reque
     assert.deepEqual(delays, [100]);
 });
 
+test('Data Manager validate-only mode sends the flag and accepts an empty success body', async () => {
+    const { deliver } = require('../googleDataManager');
+    const result = await deliver('123', null, {
+        reference_id: 456, amounts: { total: { amount: 12.5 } }, currency: 'SAR',
+        customer: { email: 'buyer@example.test' }
+    }, {
+        validateOnly: true,
+        config: {
+            enabled: true, customerId: '5365425266', conversionActionId: '6883871446',
+            customerDataConsentGranted: true,
+            timeoutMs: 1000, maxAttempts: 1, baseDelayMs: 100, maxDelayMs: 1000
+        },
+        accessToken: 'test-access-token',
+        fetchFn: async (_url, request) => {
+            const payload = JSON.parse(request.body);
+            assert.equal(payload.validateOnly, true);
+            assert.equal(payload.events[0].adIdentifiers, undefined);
+            return { ok: true, status: 200, json: async () => ({}) };
+        }
+    });
+    assert.equal(result.validateOnly, true);
+    assert.equal(result.requestId, null);
+});
+
 test('Data Manager status response preserves Google processing errors without event data', async () => {
     const { retrieveStatus } = require('../googleDataManager');
     const result = await retrieveStatus('request-abc', {
@@ -517,6 +543,101 @@ test('Data Manager failure keeps the conversion retryable', async () => {
         }), /rejected/);
         assert.deepEqual(calls, ['released']);
     } finally { global.fetch = oldFetch; }
+});
+
+test('approved recovery validates then submits each configured order exactly once', async () => {
+    const values = new Map();
+    const receipts = [];
+    let validations = 0;
+    let submissions = 0;
+    const redis = {
+        get: async key => values.get(key) || null,
+        set: async (key, value, options = {}) => {
+            if (options.NX && values.has(key)) return null;
+            values.set(key, String(value));
+            return 'OK';
+        },
+        eval: async (_script, options) => values.delete(options.keys[0]) ? 1 : 0
+    };
+    const { routes } = loadIndex({
+        getMerchantToken: async () => ({ access_token: 'salla-access-token', expires_at: Math.floor(Date.now() / 1000) + 3600 }),
+        getDataManagerReceipt: async () => null,
+        saveDataManagerReceipt: async (id, receipt) => receipts.push({ id, receipt })
+    }, {
+        enabled: () => true,
+        deliver: async (orderId, tracking, _order, options = {}) => {
+            assert.equal(tracking, null);
+            if (options.validateOnly) validations++;
+            else submissions++;
+            return {
+                requestId: `${options.validateOnly ? 'validate' : 'submit'}-${orderId}`,
+                trackingType: null, trackingFingerprint: null,
+                customerIdentifierTypes: ['emailAddress'], attempts: 1, status: 200, durationMs: 1
+            };
+        }
+    }, redis);
+    const route = routes.find(value => value.method === 'POST' && value.path === '/admin/recover-google-ads');
+    const oldFetch = global.fetch;
+    const oldEnv = {
+        secret: process.env.RECOVERY_SECRET, batch: process.env.RECOVERY_BATCH_ID,
+        merchant: process.env.RECOVERY_MERCHANT_ID, orders: process.env.RECOVERY_ORDER_IDS
+    };
+    process.env.RECOVERY_SECRET = 'test-recovery-secret';
+    process.env.RECOVERY_BATCH_ID = 'test-batch';
+    process.env.RECOVERY_MERCHANT_ID = '1375874816';
+    process.env.RECOVERY_ORDER_IDS = '1394366923,1604203926';
+    const orderData = {
+        '1394366923': { reference_id: 274120304, amount: 297.37 },
+        '1604203926': { reference_id: 275476275, amount: 99 }
+    };
+    global.fetch = async url => {
+        const orderId = String(url).split('/').at(-1);
+        const item = orderData[orderId];
+        return {
+            ok: Boolean(item), status: item ? 200 : 404,
+            json: async () => item ? { data: {
+                id: orderId, reference_id: item.reference_id, currency: 'SAR',
+                amounts: { total: { amount: item.amount, currency: 'SAR' } },
+                is_pending_payment: false, status: { slug: 'completed' },
+                customer: { email: 'buyer@example.test' }
+            } } : {}
+        };
+    };
+    const request = validateOnly => ({
+        headers: { authorization: 'Bearer test-recovery-secret' },
+        body: { order_ids: ['1394366923', '1604203926'], validate_only: validateOnly }
+    });
+    const call = async req => {
+        const response = {
+            statusCode: 200, body: null,
+            status(code) { this.statusCode = code; return this; },
+            json(body) { this.body = body; return this; },
+            send(body) { this.body = body; return this; }
+        };
+        await route.handlers.at(-1)(req, response);
+        return response;
+    };
+    try {
+        const validation = await call(request(true));
+        assert.equal(validation.statusCode, 200);
+        assert.equal(validation.body.status, 'validated');
+        assert.equal(validations, 2);
+        const first = await call(request(false));
+        assert.equal(first.statusCode, 200);
+        assert.equal(first.body.status, 'submitted');
+        assert.equal(submissions, 2);
+        assert.equal(receipts.length, 2);
+        const repeated = await call(request(false));
+        assert.equal(repeated.statusCode, 200);
+        assert.equal(submissions, 2);
+        assert.equal(repeated.body.results.every(item => item.alreadySubmitted), true);
+        assert.doesNotMatch(JSON.stringify([first.body, repeated.body, receipts]), /buyer@example\.test/);
+    } finally {
+        global.fetch = oldFetch;
+        const restore = (name, value) => value === undefined ? delete process.env[name] : process.env[name] = value;
+        restore('RECOVERY_SECRET', oldEnv.secret); restore('RECOVERY_BATCH_ID', oldEnv.batch);
+        restore('RECOVERY_MERCHANT_ID', oldEnv.merchant); restore('RECOVERY_ORDER_IDS', oldEnv.orders);
+    }
 });
 
 
