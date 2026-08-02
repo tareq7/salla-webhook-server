@@ -173,7 +173,8 @@
             entity_id: entity.entity_id,
             tracking_id: clickData.tracking_id,
             tracking_type: clickData.tracking_type,
-            client_id: extractGaClientId()
+            client_id: extractGaClientId(),
+            click_captured_at: new Date(clickData.captured_at).toISOString()
         };
 
         try {

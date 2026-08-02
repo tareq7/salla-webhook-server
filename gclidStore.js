@@ -15,6 +15,7 @@ const referenceToOrderKey = id => key('reference_to_order', id);
 const orderDetailsKey = id => key('order_details', id);
 const sentKey = id => key('sent', id);
 const processingKey = id => key('processing', id);
+const dataManagerKey = id => key('data_manager', id);
 
 function parseJson(value, label) {
     if (!value) return null;
@@ -30,6 +31,7 @@ async function saveTracking(entityType, entityId, trackingData) {
         id: trackingData.tracking_id,
         type: trackingData.tracking_type,
         clientId: trackingData.client_id || null,
+        capturedAt: Number.isFinite(trackingData.captured_at) ? trackingData.captured_at : null,
         timestamp: Date.now()
     }), { EX: DATA_TTL_SECONDS });
 }
@@ -119,6 +121,14 @@ async function markConversionSent(transactionId, owner) {
     if (result !== 1) throw new Error(`Lost conversion claim for ${transactionId}`);
 }
 
+async function saveDataManagerReceipt(transactionId, receipt) {
+    await (await getRedis()).set(dataManagerKey(transactionId), JSON.stringify(receipt), { EX: SENT_TTL_SECONDS });
+}
+
+async function getDataManagerReceipt(transactionId) {
+    return parseJson(await (await getRedis()).get(dataManagerKey(transactionId)), dataManagerKey(transactionId));
+}
+
 async function scanKeys(pattern) {
     const redis = await getRedis();
     const keys = [];
@@ -174,5 +184,6 @@ module.exports = {
     saveTracking, getTrackingForOrder, deleteTrackingForOrder,
     saveOrderDetails, getOrderDetails, deleteOrderDetails, getOrderIdByCartId, getOrderIdByReferenceId,
     claimConversion, releaseConversionClaim, markConversionSent, scanKeys,
+    saveDataManagerReceipt, getDataManagerReceipt,
     saveMerchantToken, getMerchantToken, saveRejectedWebhook
 };

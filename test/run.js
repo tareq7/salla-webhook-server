@@ -18,11 +18,12 @@ function makeStorage(initial = {}) {
     };
 }
 
-function loadIndex(storeOverrides = {}) {
+function loadIndex(storeOverrides = {}, dataManagerOverrides = {}) {
     process.env.SALLA_WEBHOOK_SECRET = 'test-webhook-secret';
     process.env.ADMIN_SECRET = 'test-admin-secret';
     process.env.CRON_SECRET = 'test-cron-secret';
     process.env.OBSERVATORY_SECRET = 'test-observatory-secret';
+    delete process.env.GOOGLE_DATA_MANAGER_ENABLED;
 
     const routes = [];
     const middlewares = [];
@@ -44,12 +45,21 @@ function loadIndex(storeOverrides = {}) {
         markConversionSent: async () => {},
         deleteTrackingForOrder: async () => {},
         deleteOrderDetails: async () => {},
+        saveDataManagerReceipt: async () => {},
+        getDataManagerReceipt: async () => null,
         getTrackingForOrder: async () => null,
         getOrderDetails: async () => null,
         scanKeys: async () => [],
         ...storeOverrides
     };
     const redisMock = { getRedis: async () => ({}), closeRedis: async () => {} };
+    const dataManagerMock = {
+        enabled: () => false,
+        trackingFingerprint: value => value ? 'test-fingerprint' : null,
+        deliver: async () => ({ enabled: false }),
+        retrieveStatus: async () => ({ enabled: false }),
+        ...dataManagerOverrides
+    };
 
     const originalLoad = Module._load;
     Module._load = function (request, parent, isMain) {
@@ -57,6 +67,7 @@ function loadIndex(storeOverrides = {}) {
         if (request === 'express-rate-limit') return rateLimitMock;
         if (request === './gclidStore') return storeMock;
         if (request === './redis') return redisMock;
+        if (request === './googleDataManager') return dataManagerMock;
         return originalLoad.call(this, request, parent, isMain);
     };
     const file = require.resolve('../index.js');
@@ -251,6 +262,161 @@ test('sGTM delivery retries network failures without leaking the request URL', a
     assert.equal(calls, 2);
 });
 
+test('Data Manager payload uses the website conversion action and contains no customer PII', () => {
+    const { buildPayload } = require('../googleDataManager');
+    const payload = buildPayload('1394366923', { id: 'valid-gclid', type: 'gclid' }, {
+        reference_id: 274120304,
+        amounts: { total: { amount: 297.37 } },
+        currency: 'sar',
+        __eventTimestamp: 'Sun Jul 26 2026 09:41:52 GMT+0300',
+        customer: { email: 'must-not-leak@example.test', mobile: '+966500000000' }
+    }, {
+        enabled: true,
+        customerId: '5365425266',
+        conversionActionId: '6883871446'
+    });
+    assert.deepEqual(payload.destinations, [{
+        operatingAccount: { accountType: 'GOOGLE_ADS', accountId: '5365425266' },
+        loginAccount: { accountType: 'GOOGLE_ADS', accountId: '5365425266' },
+        productDestinationId: '6883871446'
+    }]);
+    assert.deepEqual(payload.events, [{
+        adIdentifiers: { gclid: 'valid-gclid' },
+        conversionValue: 297.37,
+        currency: 'SAR',
+        eventTimestamp: '2026-07-26T06:41:52.000Z',
+        transactionId: '274120304',
+        eventSource: 'WEB'
+    }]);
+    assert.doesNotMatch(JSON.stringify(payload), /must-not-leak|966500000000/);
+});
+
+test('Data Manager retries a transient response and returns the diagnostic request ID', async () => {
+    const { deliver, resetTokenCache } = require('../googleDataManager');
+    resetTokenCache();
+    const statuses = [503, 200];
+    const delays = [];
+    const result = await deliver('123', { id: 'click-123', type: 'gclid' }, {
+        reference_id: 456,
+        amounts: { total: { amount: 12.5 } },
+        currency: 'SAR'
+    }, {
+        config: {
+            enabled: true, customerId: '5365425266', conversionActionId: '6883871446',
+            timeoutMs: 1000, maxAttempts: 2, baseDelayMs: 100, maxDelayMs: 1000
+        },
+        accessToken: 'test-access-token',
+        fetchFn: async (_url, request) => {
+            assert.equal(request.headers.Authorization, 'Bearer test-access-token');
+            const status = statuses.shift();
+            return {
+                ok: status === 200, status,
+                json: async () => status === 200 ? { requestId: 'request-abc' } : { error: { status: 'UNAVAILABLE' } }
+            };
+        },
+        sleep: async ms => delays.push(ms),
+        random: () => 0.5
+    });
+    assert.equal(result.requestId, 'request-abc');
+    assert.equal(result.attempts, 2);
+    assert.deepEqual(delays, [100]);
+});
+
+test('Data Manager status response preserves Google processing errors without event data', async () => {
+    const { retrieveStatus } = require('../googleDataManager');
+    const result = await retrieveStatus('request-abc', {
+        config: { enabled: true, timeoutMs: 1000 },
+        accessToken: 'test-access-token',
+        fetchFn: async url => {
+            assert.match(url, /requestStatus:retrieve\?requestId=request-abc$/);
+            return {
+                ok: true, status: 200,
+                json: async () => ({ requestStatusPerDestination: [{
+                    requestStatus: 'FAILED',
+                    eventsIngestionStatus: { recordCount: '1' },
+                    errorInfo: { errorCounts: [{ recordCount: '1', reason: 'PROCESSING_ERROR_REASON_INVALID_CLICK' }] }
+                }] })
+            };
+        }
+    });
+    assert.deepEqual(result, {
+        enabled: true,
+        status: 'FAILED',
+        destinations: [{
+            requestStatus: 'FAILED', recordCount: '1',
+            errors: [{ reason: 'PROCESSING_ERROR_REASON_INVALID_CLICK', recordCount: '1' }],
+            warnings: []
+        }]
+    });
+    assert.doesNotMatch(JSON.stringify(result), /request-abc|test-access-token/);
+});
+
+test('protected Data Manager status endpoint stores the terminal diagnostic', async () => {
+    const saved = [];
+    const { routes } = loadIndex({
+        getDataManagerReceipt: async () => ({ requestId: 'request-abc', status: 'submitted', submittedAt: '2026-08-02T00:00:00.000Z' }),
+        saveDataManagerReceipt: async (id, receipt) => saved.push({ id, receipt })
+    }, {
+        retrieveStatus: async () => ({
+            enabled: true, status: 'SUCCESS',
+            destinations: [{ requestStatus: 'SUCCESS', recordCount: '1', errors: [], warnings: [] }]
+        })
+    });
+    const route = routes.find(value => value.method === 'GET' && value.path === '/admin/data-manager-status');
+    const response = {
+        statusCode: 200, body: null,
+        status(code) { this.statusCode = code; return this; },
+        json(body) { this.body = body; return this; },
+        send(body) { this.body = body; return this; }
+    };
+    await route.handlers.at(-1)({ headers: { authorization: 'Bearer test-admin-secret' }, query: { transaction_id: '274120304' } }, response);
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.delivery.status, 'SUCCESS');
+    assert.equal(saved[0].id, '274120304');
+    assert.equal(saved[0].receipt.destinations[0].recordCount, '1');
+});
+
+test('conversion is marked sent only after Data Manager accepts it', async () => {
+    const calls = [];
+    const { exported } = loadIndex({
+        claimConversion: async () => 'owner',
+        markConversionSent: async () => calls.push('marked'),
+        saveDataManagerReceipt: async (_id, receipt) => calls.push(`receipt:${receipt.requestId}`),
+        deleteTrackingForOrder: async () => {},
+        deleteOrderDetails: async () => {}
+    }, {
+        enabled: () => true,
+        deliver: async () => ({ requestId: 'dm-request-1', trackingFingerprint: 'fingerprint', attempts: 1, status: 200, durationMs: 10 })
+    });
+    const oldFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 204 });
+    try {
+        assert.equal(await exported.processConversion('123', null, { id: 'gclid', type: 'gclid' }, {
+            reference_id: 456, amounts: { total: { amount: 5 } }, currency: 'SAR', customer: {}
+        }), true);
+        assert.deepEqual(calls, ['receipt:dm-request-1', 'marked']);
+    } finally { global.fetch = oldFetch; }
+});
+
+test('Data Manager failure keeps the conversion retryable', async () => {
+    const calls = [];
+    const { exported } = loadIndex({
+        claimConversion: async () => 'owner',
+        releaseConversionClaim: async () => calls.push('released')
+    }, {
+        enabled: () => true,
+        deliver: async () => { throw Object.assign(new Error('rejected'), { code: 'DATA_MANAGER_HTTP_ERROR', retryable: false }); }
+    });
+    const oldFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 204 });
+    try {
+        await assert.rejects(() => exported.processConversion('123', null, { id: 'gclid', type: 'gclid' }, {
+            reference_id: 456, amounts: { total: { amount: 5 } }, currency: 'SAR', customer: {}
+        }), /rejected/);
+        assert.deepEqual(calls, ['released']);
+    } finally { global.fetch = oldFetch; }
+});
+
 
 test('conversion claim atomically checks sent marker and acquires processing lock', async () => {
     let evalCall;
@@ -317,7 +483,10 @@ test('tracker sends order-only text/plain payload and clears click after success
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(request.url, 'https://track.ssp-1.com/track-gclid');
     assert.equal(request.options.headers['Content-Type'], 'text/plain;charset=UTF-8');
-    assert.deepEqual(JSON.parse(request.options.body), {
+    const requestBody = JSON.parse(request.options.body);
+    assert.match(requestBody.click_captured_at, /^\d{4}-\d{2}-\d{2}T/);
+    delete requestBody.click_captured_at;
+    assert.deepEqual(requestBody, {
         entity_type: 'order',
         entity_id: '1671795666',
         tracking_id: 'test-click-123',

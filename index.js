@@ -5,6 +5,7 @@ const rateLimit = require('express-rate-limit');
 const store = require('./gclidStore');
 const { getRedis, closeRedis } = require('./redis');
 const { deliver: deliverToSgtm } = require('./sgtmDelivery');
+const dataManager = require('./googleDataManager');
 
 const required = name => {
     const value = process.env[name];
@@ -115,13 +116,48 @@ async function sendToSgtm(orderId, tracking, order) {
     try {
         const result = await deliverToSgtm(`${SGTM_URL}/g/collect?${params}`);
         console.log('Purchase sent to sGTM', {
-            transactionId, attributed: Boolean(tracking?.id),
+            orderId, transactionId, attributed: Boolean(tracking?.id),
+            trackingType: tracking?.type || null,
+            trackingFingerprint: dataManager.trackingFingerprint(tracking?.id),
+            clickAgeMs: Number.isFinite(tracking?.capturedAt) ? Math.max(0, Date.now() - tracking.capturedAt) : null,
             attempts: result.attempts, status: result.status, durationMs: result.durationMs
         });
+        return result;
     } catch (error) {
         console.error('sGTM delivery failed', {
-            transactionId, code: error.code || 'SGTM_UNKNOWN_ERROR',
+            orderId, transactionId, code: error.code || 'SGTM_UNKNOWN_ERROR',
             status: error.status, attempts: error.attempts, retryable: error.retryable
+        });
+        throw error;
+    }
+}
+
+async function sendToDataManager(orderId, tracking, order) {
+    if (!dataManager.enabled()) return { enabled: false };
+    if (!tracking?.id || !['gclid', 'wbraid', 'gbraid'].includes(tracking.type)) {
+        return { enabled: false, reason: 'no_supported_click_identifier' };
+    }
+    const transactionId = String(order.reference_id || orderId);
+    try {
+        const result = await dataManager.deliver(orderId, tracking, order);
+        await store.saveDataManagerReceipt(transactionId, {
+            requestId: result.requestId,
+            status: 'submitted',
+            trackingType: tracking?.type || null,
+            trackingFingerprint: result.trackingFingerprint,
+            submittedAt: new Date().toISOString()
+        });
+        console.log('Purchase submitted to Google Data Manager', {
+            orderId, transactionId, requestId: result.requestId,
+            trackingType: tracking?.type || null,
+            trackingFingerprint: result.trackingFingerprint,
+            attempts: result.attempts, status: result.status, durationMs: result.durationMs
+        });
+        return result;
+    } catch (error) {
+        console.error('Google Data Manager delivery failed', {
+            orderId, transactionId, code: error.code || 'DATA_MANAGER_UNKNOWN_ERROR',
+            status: error.status, reason: error.reason, attempts: error.attempts, retryable: error.retryable
         });
         throw error;
     }
@@ -132,7 +168,10 @@ async function processConversion(orderId, cartId, tracking, order) {
     if (!owner) return false;
     let sent = false;
     try {
-        await sendToSgtm(orderId, tracking, order);
+        await Promise.all([
+            sendToSgtm(orderId, tracking, order),
+            sendToDataManager(orderId, tracking, order)
+        ]);
         await store.markConversionSent(orderId, owner);
         sent = true;
     } catch (error) {
@@ -163,13 +202,20 @@ async function reconcile(orderId, cartId) {
 app.post('/track-gclid', trackLimiter, async (req, res) => {
     try {
         const body = typeof req.body === 'string' ? JSON.parse(req.body || '') : req.body;
-        const { entity_type: type, entity_id: id, tracking_id: trackingId, tracking_type: trackingType, client_id: clientId } = body;
+        const { entity_type: type, entity_id: id, tracking_id: trackingId, tracking_type: trackingType, client_id: clientId, click_captured_at: clickCapturedAt } = body;
         if (!['cart', 'order'].includes(type)) return res.status(400).send('Invalid entity type');
         if (!validIdentifier(id, 128)) return res.status(400).send('Invalid entity ID');
         if (!validIdentifier(trackingId, 256)) return res.status(400).send('Invalid tracking ID');
         if (!['gclid', 'wbraid', 'gbraid'].includes(trackingType)) return res.status(400).send('Invalid tracking type');
         if (clientId != null && !validIdentifier(clientId, 100)) return res.status(400).send('Invalid client ID');
-        await store.saveTracking(type, id, { tracking_id: trackingId, tracking_type: trackingType, client_id: clientId });
+        const capturedAtMs = clickCapturedAt == null ? null : Date.parse(String(clickCapturedAt));
+        if (clickCapturedAt != null && (!Number.isFinite(capturedAtMs) || capturedAtMs > Date.now() + 300000 || Date.now() - capturedAtMs > 30 * 86400000)) {
+            return res.status(400).send('Invalid click capture time');
+        }
+        await store.saveTracking(type, id, {
+            tracking_id: trackingId, tracking_type: trackingType, client_id: clientId,
+            captured_at: Number.isFinite(capturedAtMs) ? capturedAtMs : null
+        });
         
         let orderId = null;
         if (type === 'order') {
@@ -222,7 +268,7 @@ app.post('/webhook', async (req, res) => {
                      statusSlug !== 'cancelled' &&
                      order.is_pending_payment === false;
         if (['order.created', 'order.payment.updated'].includes(payload.event) && paid) {
-            const storedOrder = { ...order, e164Phone: normalizePhone(order.customer?.mobile) };
+            const storedOrder = { ...order, e164Phone: normalizePhone(order.customer?.mobile), __eventTimestamp: payload.created_at || null };
             const cartId = order.cart_id ? String(order.cart_id) : (order.checkout_id ? String(order.checkout_id) : null);
             await store.saveOrderDetails(orderId, cartId, storedOrder);
             await reconcile(orderId, cartId); // write then re-read closes the lost-wakeup race
@@ -279,6 +325,35 @@ app.get('/admin/db-status', async (req, res) => {
         ]);
         res.json({ status: 'success', summary: { processed_orders_count: sent.length, pending_clicks_count: clicks.length, pending_orders_count: orders.length, cart_to_order_mappings_count: mappings.length, rejected_webhooks_count: rejected.length } });
     } catch (error) { res.status(500).json({ error: 'Internal Server Error' }); }
+});
+app.get('/admin/data-manager-status', async (req, res) => {
+    if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
+    const transactionId = typeof req.query.transaction_id === 'string' ? req.query.transaction_id : '';
+    if (!validIdentifier(transactionId, 128)) return res.status(400).json({ error: 'Invalid transaction ID' });
+    try {
+        const receipt = await store.getDataManagerReceipt(transactionId);
+        if (!receipt?.requestId) return res.status(404).json({ error: 'Data Manager receipt not found' });
+        const result = await dataManager.retrieveStatus(receipt.requestId);
+        const updated = {
+            ...receipt,
+            status: result.status,
+            destinations: result.destinations,
+            checkedAt: new Date().toISOString()
+        };
+        await store.saveDataManagerReceipt(transactionId, updated);
+        console.log('Google Data Manager status checked', {
+            transactionId, requestId: receipt.requestId, status: result.status,
+            errors: result.destinations.reduce((total, item) => total + item.errors.length, 0),
+            warnings: result.destinations.reduce((total, item) => total + item.warnings.length, 0)
+        });
+        return res.json({ status: 'success', transactionId, delivery: updated });
+    } catch (error) {
+        console.error('Google Data Manager status check failed', {
+            transactionId, code: error.code || 'DATA_MANAGER_STATUS_UNKNOWN_ERROR',
+            status: error.status, reason: error.reason, retryable: error.retryable
+        });
+        return res.status(error.retryable ? 503 : 502).json({ error: 'Data Manager status unavailable', code: error.code || 'DATA_MANAGER_STATUS_UNKNOWN_ERROR' });
+    }
 });
 app.get('/admin/rejected-webhooks', async (req, res) => {
     if (!authorized(req, ADMIN_SECRET)) return res.status(401).send('Unauthorized');
@@ -416,4 +491,4 @@ if (require.main === module) {
     server = app.listen(process.env.PORT || 3000, () => console.log(`Server listening on port ${process.env.PORT || 3000}`));
     process.on('SIGTERM', () => server.close(async () => { await closeRedis(); process.exit(0); }));
 }
-module.exports = { app, authorized, buildReconciliationStates, normalizePhone, validIdentifier, reconcile, processConversion, sendToSgtm, getSallaAccessToken };
+module.exports = { app, authorized, buildReconciliationStates, normalizePhone, validIdentifier, reconcile, processConversion, sendToSgtm, sendToDataManager, getSallaAccessToken };

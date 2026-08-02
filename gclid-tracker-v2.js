@@ -577,7 +577,10 @@
                 clickData.tracking_type,
 
             client_id:
-                clientId
+                clientId,
+
+            click_captured_at:
+                new Date(clickData.captured_at).toISOString()
         };
 
         log(
